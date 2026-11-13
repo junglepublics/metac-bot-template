@@ -1,0 +1,256 @@
+"""Discrete integer CDF snapping for continuous questions with integer outcomes.
+
+When Metaculus labels a question as "continuous" (cdf_size=201) but the
+resolution values are naturally integers (e.g. "How many X will happen?"),
+the smooth CDF wastes probability mass between integers. Snapping the CDF
+to a step function that concentrates mass on integer values improves scoring.
+
+Server-side constraints (from Metaculus backend):
+  - Min step between adjacent CDF values: 0.01 / N (default 5e-5 for N=200)
+  - Max step: 0.2 * 200 / N (default 0.2)
+  - CDF must be strictly increasing (no flat segments)
+
+The snapping algorithm:
+  1. Extract integer PMF from smooth CDF via half-integer interpolation
+  2. Reconstruct step-function CDF with steps at integer positions
+  3. Apply uniform mixture for min-step compliance (primary min-step mechanism)
+  4. Apply max-step redistribution + boundary pinning via safe_cdf_bounds()
+     (which also re-enforces min-step after its pin+cummax pass)
+  5. Post-hoc min-step verification (guard for concentrated distributions)
+"""
+
+import logging
+import math
+
+import numpy as np
+from forecasting_tools.data_models.numeric_report import NumericDistribution
+from forecasting_tools.data_models.questions import NumericQuestion
+from pydantic import BaseModel
+
+from metaculus_bot.constants import DISCRETE_SNAP_MAX_INTEGERS, DISCRETE_SNAP_UNIFORM_MIX, NUM_MIN_PROB_STEP
+from metaculus_bot.numeric.config import grid_bin_width, grid_is_outcome_space
+from metaculus_bot.numeric.pchip_cdf import safe_cdf_bounds
+from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
+
+logger = logging.getLogger(__name__)
+
+# Algorithm-internal constants
+_NEAR_ZERO_EPSILON: float = 1e-12
+_ALPHA_SAFETY_MARGIN: float = 1.1
+
+
+class OutcomeTypeResult(BaseModel):
+    """Structured output for discrete/continuous classification."""
+
+    is_discrete_integer: bool
+
+
+def majority_votes_discrete(votes: list[bool]) -> bool:
+    """Return True if a strict majority of votes are True (DISCRETE)."""
+    if not votes:
+        return False
+    return sum(votes) > len(votes) / 2
+
+
+def _snappable_integers(lower_bound: float, upper_bound: float) -> np.ndarray | None:
+    """Integers inside the bounds, or None when snapping should be skipped.
+
+    The count is checked arithmetically before the array exists: a wide range (post 40165
+    spans 6e10 integers, 480 GB as int64) must be rejected without being materialised.
+    """
+    first_integer = math.ceil(lower_bound)
+    last_integer = math.floor(upper_bound)
+    n_integers = last_integer - first_integer + 1
+    if n_integers > DISCRETE_SNAP_MAX_INTEGERS:
+        logger.info(
+            "Discrete snap skipped: %d integers > max %d | bounds=[%.1f, %.1f]",
+            n_integers,
+            DISCRETE_SNAP_MAX_INTEGERS,
+            lower_bound,
+            upper_bound,
+        )
+        return None
+
+    if n_integers <= 0:
+        logger.warning("Discrete snap skipped: no integers in bounds [%.4f, %.4f]", lower_bound, upper_bound)
+        return None
+
+    return np.arange(first_integer, last_integer + 1)
+
+
+def _integer_pmf(
+    p_smooth: np.ndarray,
+    x_grid: np.ndarray,
+    integers: np.ndarray,
+    *,
+    lower_bound: float,
+    upper_bound: float,
+) -> np.ndarray:
+    """Mass per integer, read off the smooth CDF across each integer's half-open interval.
+
+    Renormalised to the smooth CDF's total mass so an open-bound tail is not silently
+    reassigned to the interior.
+    """
+    pmf = np.zeros(len(integers), dtype=float)
+    for i, k in enumerate(integers):
+        upper_half = min(k + 0.5, upper_bound)
+        lower_half = max(k - 0.5, lower_bound)
+        cdf_upper = float(np.interp(upper_half, x_grid, p_smooth))
+        cdf_lower = float(np.interp(lower_half, x_grid, p_smooth))
+        pmf[i] = max(0.0, cdf_upper - cdf_lower)
+
+    total_pmf = float(pmf.sum())
+    if total_pmf > _NEAR_ZERO_EPSILON:
+        pmf *= float(p_smooth[-1] - p_smooth[0]) / total_pmf
+    return pmf
+
+
+def _step_cdf_from_pmf(
+    pmf: np.ndarray,
+    p_smooth: np.ndarray,
+    x_grid: np.ndarray,
+    integers: np.ndarray,
+    *,
+    open_lower_bound: bool,
+) -> np.ndarray:
+    """Lay the integer PMF back onto the submission grid as a step function."""
+    cumulative_pmf = np.cumsum(pmf)
+    tail_lower = float(p_smooth[0])
+
+    step_cdf = np.full(len(x_grid), tail_lower, dtype=float)
+    indices = np.searchsorted(integers.astype(float), x_grid, side="right")
+    mask = indices > 0
+    step_cdf[mask] = tail_lower + cumulative_pmf[indices[mask] - 1]
+
+    # A step at k == lower_bound lands mass in bucket 0, which a closed bound must keep at cdf[0] == 0
+    if not open_lower_bound:
+        step_cdf[0] = tail_lower
+
+    # Pin final endpoint to preserve upper tail mass
+    step_cdf[-1] = float(p_smooth[-1])
+    return step_cdf
+
+
+def _uniform_mix_weight(total_smooth: float, n_points: int) -> float:
+    """Uniform-mixture weight: the floor that keeps every bin above the server min-step."""
+    if total_smooth > _NEAR_ZERO_EPSILON:
+        min_alpha_for_step = NUM_MIN_PROB_STEP * n_points / total_smooth * _ALPHA_SAFETY_MARGIN
+    else:
+        min_alpha_for_step = 1.0
+    return min(1.0, max(DISCRETE_SNAP_UNIFORM_MIX, min_alpha_for_step))
+
+
+def snap_cdf_to_integers(
+    cdf_values: list[float],
+    lower_bound: float,
+    upper_bound: float,
+    *,
+    open_lower_bound: bool,
+    open_upper_bound: bool,
+    question_id: int | str | None = None,
+) -> list[float] | None:
+    """Convert a smooth 201-point CDF to a step function at integer boundaries.
+
+    Returns snapped CDF values (list of 201 floats), or None if snapping
+    should be skipped (too many integers, etc.). ``question_id`` only labels the
+    ``CDF_MAXSTEP_CLIP`` marker ``safe_cdf_bounds`` may emit below.
+    """
+    n_points = len(cdf_values)
+    x_grid = np.linspace(lower_bound, upper_bound, n_points)
+    p_smooth = np.array(cdf_values, dtype=float)
+
+    integers = _snappable_integers(lower_bound, upper_bound)
+    if integers is None:
+        return None
+
+    # --- Step 1: Extract integer PMF via half-integer interpolation ---
+    pmf = _integer_pmf(p_smooth, x_grid, integers, lower_bound=lower_bound, upper_bound=upper_bound)
+
+    # --- Step 2: Reconstruct step CDF at grid points ---
+    step_cdf = _step_cdf_from_pmf(pmf, p_smooth, x_grid, integers, open_lower_bound=open_lower_bound)
+
+    # --- Step 3: Uniform mixture for min-step compliance ---
+    alpha = _uniform_mix_weight(float(p_smooth[-1] - p_smooth[0]), n_points)
+    uniform_cdf = np.linspace(p_smooth[0], p_smooth[-1], n_points)
+    mixed_cdf = (1.0 - alpha) * step_cdf + alpha * uniform_cdf
+
+    # --- Step 4: Max-step redistribution + boundary pinning (re-enforces min-step after its own pass) ---
+    enforced_cdf = safe_cdf_bounds(
+        mixed_cdf,
+        open_lower_bound,
+        open_upper_bound,
+        question_id=question_id,
+        model_name="ensemble_discrete_snap",
+    )
+
+    # Guard: uniform mixture may not satisfy min-step for very concentrated distributions
+    diffs = np.diff(enforced_cdf)
+    min_diff = float(np.min(diffs))
+    if min_diff < NUM_MIN_PROB_STEP - 1e-10:
+        logger.error(
+            "Discrete snap min-step violation after enforcement: %.8f < %.8f",
+            min_diff,
+            NUM_MIN_PROB_STEP,
+        )
+        return None
+
+    logger.info(
+        "Discrete snap applied | integers=%d | min_step=%.6f | max_step=%.6f | alpha=%.4f",
+        len(integers),
+        min_diff,
+        float(np.max(diffs)),
+        alpha,
+    )
+    return enforced_cdf.tolist()
+
+
+def snap_distribution_to_integers(
+    distribution: NumericDistribution,
+    question: NumericQuestion,
+) -> NumericDistribution | None:
+    """Snap a NumericDistribution's CDF to integer boundaries.
+
+    Returns a new distribution with the snapped CDF, or None if snapping should be skipped:
+    non-finite bounds, a natively discrete question (its grid IS its outcome space, so an
+    integer vote is wrong there; ``grid_is_outcome_space`` reads the type, not ``cdf_size``),
+    or a grid other than the 201-point one the snap's step limits belong to. Why no
+    grid-alignment guard is needed: ``docs/numeric_pipeline.md`` "Step 7".
+    """
+    if not (np.isfinite(question.lower_bound) and np.isfinite(question.upper_bound)):
+        logger.warning(
+            "Discrete snap skipped: non-finite bounds lower=%s upper=%s", question.lower_bound, question.upper_bound
+        )
+        return None
+
+    if grid_is_outcome_space(question):
+        logger.info(
+            "Discrete snap skipped: the question's grid is already its outcome space | type=%s | cdf_size=%d | grid_step=%.6g",
+            type(question).__name__,
+            question.cdf_size,
+            grid_bin_width(question.lower_bound, question.upper_bound, question.cdf_size),
+        )
+        return None
+
+    if not hasattr(distribution, "_pchip_cdf_values"):
+        logger.warning("Discrete snap skipped: distribution is %s (no pchip CDF values)", type(distribution).__name__)
+        return None
+    cdf_probs: list[float] = list(distribution._pchip_cdf_values)  # type: ignore[attr-defined]
+
+    snapped_cdf = snap_cdf_to_integers(
+        cdf_values=cdf_probs,
+        lower_bound=question.lower_bound,
+        upper_bound=question.upper_bound,
+        open_lower_bound=question.open_lower_bound,
+        open_upper_bound=question.open_upper_bound,
+        question_id=question.id_of_question,
+    )
+
+    if snapped_cdf is None:
+        return None
+
+    return create_pchip_numeric_distribution(
+        pchip_cdf=snapped_cdf,
+        percentile_list=distribution.declared_percentiles,
+        question=question,
+        zero_point=question.zero_point,
+    )

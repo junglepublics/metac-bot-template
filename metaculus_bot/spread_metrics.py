@@ -1,0 +1,213 @@
+"""Spread metrics measuring forecaster disagreement across question types.
+
+Used to decide whether to invoke an expensive stacking meta-analysis when
+individual model predictions diverge significantly.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import statistics
+from typing import Any
+
+import numpy as np
+from forecasting_tools import (
+    BinaryQuestion,
+    MultipleChoiceQuestion,
+    NumericQuestion,
+    PredictedOptionList,
+)
+from forecasting_tools.data_models.numeric_report import Percentile
+from forecasting_tools.data_models.questions import DateQuestion, MetaculusQuestion
+
+from metaculus_bot.numeric.date_axis import numeric_view
+from metaculus_bot.numeric.percentile_set import EXPECTED_KEYS, PercentileSet, percentile_key
+from metaculus_bot.prob_math_utils import logit
+
+logger: logging.Logger = logging.getLogger(__name__)
+
+# Percentile LABELS, not positions, so growing the standard percentile set cannot silently shift them.
+_KEY_SPREAD_PERCENTILES: list[float] = [0.10, 0.50, 0.90]
+
+
+def _has_standard_labels(model_pcts: list[Percentile]) -> bool:
+    """True iff the model's percentile labels are exactly the standard percentile set.
+
+    Uses ``percentile_set``'s canonical rounded key set (``EXPECTED_KEYS``) to
+    distinguish continuous forecaster output (the standard set) from a
+    discrete-resampled cumulative-probability CDF grid. The length check guards
+    against a duplicate label masquerading as the standard set.
+    """
+    return (
+        len(model_pcts) == len(EXPECTED_KEYS)
+        and frozenset(percentile_key(p.percentile) for p in model_pcts) == EXPECTED_KEYS
+    )
+
+
+def _key_percentile_values(model_pcts: list[Percentile], question: NumericQuestion) -> tuple[float, float, float]:
+    """Return the (P10, P50, P90) VALUES for one model's declared percentiles.
+
+    Continuous forecaster output declares the standard percentile set, so P10/P50/P90 resolve
+    to exact label nodes via ``PercentileSet``. A built distribution (``build_numeric_distribution``,
+    ``build_pmf_distribution``) instead carries the question's own ``cdf_size``-point CDF grid,
+    labelled by CUMULATIVE PROBABILITY, and is recognised by that length alone: an open bound
+    can legitimately hold heavy out-of-range mass (labels starting at 0.40, or the four labels
+    of a 3-bin Mantic grid ending at 0.30 with 70% above the range), so where the labels start
+    and end says nothing about whether the list is a grid. The grid is read as an empirical CDF
+    with ``np.interp``, which clamps at the ends: a key percentile beyond the labels returns the
+    displayed bound, the honest answer for mass beyond an open bound. Anything else (a truncated
+    percentile list) cannot yield P10/P50/P90 without extrapolating garbage, so it fails fast.
+    """
+    if _has_standard_labels(model_pcts):
+        percentile_set = PercentileSet.from_percentiles(model_pcts)
+        return (
+            percentile_set.value_at(0.10),
+            percentile_set.value_at(0.50),
+            percentile_set.value_at(0.90),
+        )
+
+    ordered = sorted(model_pcts, key=lambda p: p.percentile)
+    labels = [p.percentile for p in ordered]
+    if len(labels) != question.cdf_size:
+        labels_range = f"[{labels[0]:.4f}, {labels[-1]:.4f}]" if labels else "[]"
+        raise ValueError(
+            "numeric_percentile_spread: declared percentiles are neither the standard percentiles "
+            f"nor the question's {question.cdf_size}-point CDF grid; cannot read key percentiles from labels "
+            f"(len={len(labels)}, range={labels_range})"
+        )
+    values = [p.value for p in ordered]
+    p10, p50, p90 = np.interp(_KEY_SPREAD_PERCENTILES, labels, values)
+    return float(p10), float(p50), float(p90)
+
+
+def binary_prob_range_spread(prediction_values: list[float]) -> float:
+    """Compute the probability range (max - min) across binary predictions.
+
+    Active trigger metric for conditional stacking. Plain probability range
+    avoids the log-odds failure mode where clamped-extreme predictions (~0 or ~1)
+    produce huge spreads even when the ensemble-median answer is correct.
+    """
+    if len(prediction_values) < 2:
+        raise ValueError("binary_prob_range_spread requires at least 2 predictions")
+    return max(prediction_values) - min(prediction_values)
+
+
+def binary_log_odds_spread(prediction_values: list[float]) -> float:
+    """Log-odds range across binary predictions.
+
+    Uses the shared ``logit`` (canonical eps=1e-4) to avoid log(0). Available as
+    an alternative spread metric; see binary_prob_range_spread.
+    """
+    if len(prediction_values) < 2:
+        raise ValueError("binary_log_odds_spread requires at least 2 predictions")
+
+    log_odds = [logit(p) for p in prediction_values]
+    return max(log_odds) - min(log_odds)
+
+
+def mc_max_option_spread(prediction_values: list[PredictedOptionList]) -> float:
+    """Compute the maximum per-option probability range across MC predictions.
+
+    For each option name, collects all models' probabilities and computes
+    max - min. Returns the largest such range across all options.
+    """
+    if len(prediction_values) < 2:
+        raise ValueError("mc_max_option_spread requires at least 2 predictions")
+
+    first_options = {o.option_name for o in prediction_values[0].predicted_options}
+    for i, pred in enumerate(prediction_values[1:], start=2):
+        pred_options = {o.option_name for o in pred.predicted_options}
+        if pred_options != first_options:
+            raise ValueError(
+                f"mc_max_option_spread: model {i} has options {sorted(pred_options)}, expected {sorted(first_options)}"
+            )
+
+    option_probabilities: dict[str, list[float]] = {}
+    for pred in prediction_values:
+        for option in pred.predicted_options:
+            option_probabilities.setdefault(option.option_name, []).append(option.probability)
+
+    max_spread = 0.0
+    for probs in option_probabilities.values():
+        spread = max(probs) - min(probs)
+        max_spread = max(max_spread, spread)
+
+    return max_spread
+
+
+def numeric_percentile_spread(
+    prediction_values: list[list[Percentile]],
+    question: NumericQuestion,
+) -> float:
+    """Compute the max normalized spread at key percentiles (10th, 50th, 90th).
+
+    Closed-bound questions normalize by the question range; open-ended ones fall back to the
+    ensemble interquartile range (median P90 minus median P10) as the denominator.
+
+    A non-positive denominator makes the ratio UNDEFINED; the reachable case is an open-bound
+    question whose models all interpolate to the same displayed bound at P10 and P90 (heavy
+    out-of-bound mass clamped by ``np.interp``). This returns ``math.inf`` there, never ``0.0``:
+    a failed measurement must not read as "the models agree", which is how
+    ``route_after_forecasts`` reads a spread of 0 (MEDIAN, skip stacking, marker
+    ``spread_below_threshold``). The caller treats ``inf`` as its own case: MEDIAN without
+    spending a crux extraction, a targeted search and a stacker call on no measurement, skip
+    reason ``spread_undefined`` so the marker never claims agreement, and a ``SPREAD_UNDEFINED``
+    WARN naming the question.
+    """
+    if len(prediction_values) < 2:
+        raise ValueError("numeric_percentile_spread requires at least 2 predictions")
+
+    key_values_by_model = [_key_percentile_values(model_pcts, question) for model_pcts in prediction_values]
+    p10_values = [values[0] for values in key_values_by_model]
+    p50_values = [values[1] for values in key_values_by_model]
+    p90_values = [values[2] for values in key_values_by_model]
+    values_by_percentile = {0.10: p10_values, 0.50: p50_values, 0.90: p90_values}
+
+    has_finite_range = (
+        not question.open_lower_bound
+        and not question.open_upper_bound
+        and math.isfinite(question.upper_bound)
+        and math.isfinite(question.lower_bound)
+    )
+
+    if has_finite_range:
+        denominator = question.upper_bound - question.lower_bound
+    else:
+        # Fallback: ensemble IQR from 10th and 90th percentiles across all models
+        denominator = statistics.median(p90_values) - statistics.median(p10_values)
+
+    if denominator <= 0:
+        logger.warning(
+            "SPREAD_UNDEFINED: question=%s qtype=numeric denominator=%.6g models=%d — key-percentile spread is "
+            "unmeasurable (non-positive denominator); reporting inf so it cannot read as agreement",
+            getattr(question, "id_of_question", None),
+            denominator,
+            len(prediction_values),
+        )
+        return math.inf
+
+    max_normalized_spread = 0.0
+    for pct in _KEY_SPREAD_PERCENTILES:
+        values_at_percentile = values_by_percentile[pct]
+        raw_spread = max(values_at_percentile) - min(values_at_percentile)
+        normalized = raw_spread / denominator
+        max_normalized_spread = max(max_normalized_spread, normalized)
+
+    return max_normalized_spread
+
+
+def compute_spread(question: MetaculusQuestion, prediction_values: list[Any]) -> float:
+    """Dispatch to the appropriate spread metric based on question type.
+
+    A date question's members are numeric distributions on the epoch-seconds axis, so it takes
+    the numeric metric against its epoch view (the range denominator is then in seconds).
+    """
+    if isinstance(question, BinaryQuestion):
+        return binary_prob_range_spread(prediction_values)
+    if isinstance(question, MultipleChoiceQuestion):
+        return mc_max_option_spread(prediction_values)
+    if isinstance(question, (NumericQuestion, DateQuestion)):
+        percentile_lists = [pv.declared_percentiles for pv in prediction_values]
+        return numeric_percentile_spread(percentile_lists, numeric_view(question))
+    raise ValueError(f"Unsupported question type for spread metrics: {type(question).__name__}")

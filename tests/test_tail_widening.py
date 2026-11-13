@@ -1,0 +1,599 @@
+import math
+from collections.abc import Sequence
+from datetime import datetime, timedelta
+from itertools import pairwise
+from types import SimpleNamespace
+from typing import ClassVar, cast
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from forecasting_tools.data_models.numeric_report import Percentile
+from forecasting_tools.data_models.questions import NumericQuestion
+
+from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
+from metaculus_bot.numeric.tail_widening import widen_declared_percentiles
+from metaculus_bot.value_extraction import ExtractionOutcome
+
+
+def _stub_open_time() -> datetime:
+    return datetime.now() - timedelta(days=30)
+
+
+def _stub_resolve_time() -> datetime:
+    return datetime.now() + timedelta(days=365)
+
+
+def _make_question(lower=0.0, upper=100.0, open_lower=False, open_upper=False):
+    return cast(
+        NumericQuestion,
+        SimpleNamespace(
+            lower_bound=lower,
+            upper_bound=upper,
+            open_lower_bound=open_lower,
+            open_upper_bound=open_upper,
+            id_of_question=777,
+            page_url="https://ex/q/777",
+            api_json={"question": {}},
+            question_text="tail widening test",
+            background_info="",
+            resolution_criteria="",
+            fine_print="",
+            unit_of_measure="units",
+            open_time=_stub_open_time(),
+            scheduled_resolution_time=_stub_resolve_time(),
+        ),
+    )
+
+
+def _standard_percentiles(values: Sequence[float]) -> list[Percentile]:
+    ps = [0.01, 0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99]
+    assert len(values) == len(ps)
+    return [Percentile(percentile=p, value=float(v)) for p, v in zip(ps, values, strict=True)]
+
+
+class TestTailWideningUnit:
+    def test_noop_when_k_is_one(self):
+        q = _make_question(0.0, 100.0, False, False)
+        base = _standard_percentiles([4, 5, 6, 8, 12, 20, 50, 80, 90, 94, 97, 98, 99])
+        out = widen_declared_percentiles(base, q, k_tail=1.0, tail_start=0.2, span_floor_gamma=0.0)
+        assert [p.value for p in out] == [p.value for p in base]
+        assert next(p.value for p in out if math.isclose(p.percentile, 0.5)) == 50
+
+    def test_k_tail_one_identity_on_declared_percentiles(self):
+        """k_tail=1.0 with gamma=0.0 must return the input list unchanged (identity pass).
+
+        Locks in the default no-op behavior after flipping TAIL_WIDEN_K_TAIL: 1.25 -> 1.0.
+        See scratch_docs_and_planning/tail_widening_empirical_calibration.md.
+        """
+        q = _make_question(0.0, 100.0, False, False)
+        shapes = [
+            [4, 5, 6, 8, 12, 20, 50, 80, 90, 94, 97, 98, 99],
+            [9, 10, 11, 13, 18, 30, 50, 70, 85, 92, 96, 98, 99],
+            [0.5, 1, 2, 5, 15, 30, 45, 60, 78, 88, 93, 97, 98],
+        ]
+        for values in shapes:
+            base = _standard_percentiles(values)
+            out = widen_declared_percentiles(base, q, k_tail=1.0, tail_start=0.2, span_floor_gamma=0.0)
+            assert [p.value for p in out] == values
+            assert [p.percentile for p in out] == [p.percentile for p in base]
+
+    def test_k_tail_below_one_raises(self):
+        """k_tail=0.8 currently silently no-ops (narrowing unimplemented). Must raise."""
+        q = _make_question(0.0, 100.0, False, False)
+        base = _standard_percentiles([4, 5, 6, 8, 12, 20, 50, 80, 90, 94, 97, 98, 99])
+        with pytest.raises(ValueError, match="narrowing is not implemented"):
+            widen_declared_percentiles(base, q, k_tail=0.8, tail_start=0.2, span_floor_gamma=0.0)
+
+    def test_k_tail_negative_raises(self):
+        """Negative k_tail is nonsense; must fail fast per repo fail-fast convention."""
+        q = _make_question(0.0, 100.0, False, False)
+        base = _standard_percentiles([4, 5, 6, 8, 12, 20, 50, 80, 90, 94, 97, 98, 99])
+        with pytest.raises(ValueError, match="narrowing is not implemented"):
+            widen_declared_percentiles(base, q, k_tail=-1.0, tail_start=0.2, span_floor_gamma=0.0)
+
+    def test_span_floor_gamma_negative_raises(self):
+        """Negative span_floor_gamma produces nonsense; must fail fast."""
+        q = _make_question(0.0, 100.0, False, False)
+        base = _standard_percentiles([4, 5, 6, 8, 12, 20, 50, 80, 90, 94, 97, 98, 99])
+        with pytest.raises(ValueError, match="must be >= 0"):
+            widen_declared_percentiles(base, q, k_tail=1.25, tail_start=0.2, span_floor_gamma=-0.5)
+
+    def test_span_floor_gamma_zero_matches_one_on_real_shapes(self):
+        """On realistic ensemble-averaged declared shapes, the span floor never binds:
+        gamma=0.0 (disabled) and gamma=1.0 (enabled) must produce identical output.
+
+        Regression test for the empirical finding in
+        scratch_docs_and_planning/tail_widening_empirical_calibration.md section 3 —
+        locks in the justification for flipping the default gamma to 0.0.
+        """
+        q = _make_question(0.0, 100.0, False, False)
+        # Shapes mirror ensemble-averaged declared percentiles on real 2026 data:
+        # the outer tail span (p05 - p025) is already at least as wide as
+        # gamma=1.0 * (p10 - p05), mirroring ensembles-of-LLMs that hedge the outer
+        # 2.5% tail conservatively. Empirical study confirms this holds on all 43
+        # production questions.
+        realistic_shapes = [
+            [1, 2, 5, 7, 15, 30, 50, 70, 85, 93, 95, 98, 99],
+            [0.5, 1, 4, 6, 12, 30, 50, 70, 88, 94, 96, 99, 99.5],
+            [5, 10, 15, 18, 25, 38, 50, 62, 75, 82, 85, 90, 95],
+            [2, 5, 12, 15, 22, 35, 50, 65, 78, 85, 88, 95, 98],
+        ]
+        for values in realistic_shapes:
+            base = _standard_percentiles(values)
+            out_zero = widen_declared_percentiles(base, q, k_tail=1.25, tail_start=0.2, span_floor_gamma=0.0)
+            out_one = widen_declared_percentiles(base, q, k_tail=1.25, tail_start=0.2, span_floor_gamma=1.0)
+            vals_zero = [p.value for p in out_zero]
+            vals_one = [p.value for p in out_one]
+            for a, b in zip(vals_zero, vals_one, strict=True):
+                assert math.isclose(a, b, rel_tol=0, abs_tol=1e-12), (values, vals_zero, vals_one)
+
+    def test_closed_bounds_widening_increases_tail_spans(self):
+        q = _make_question(0.0, 100.0, False, False)
+        base = _standard_percentiles([4, 5, 6, 8, 12, 20, 50, 80, 90, 94, 97, 98, 99])
+        p = widen_declared_percentiles(base, q, k_tail=1.3, tail_start=0.2, span_floor_gamma=0.0)
+
+        def _get(ps, target):
+            return next(x.value for x in ps if math.isclose(x.percentile, target))
+
+        # Median unchanged
+        assert math.isclose(_get(p, 0.5), 50.0, rel_tol=0, abs_tol=1e-9)
+
+        # Tail spans increased
+        base_p025, base_p05 = 5.0, 6.0
+        base_low_span_outer = base_p05 - base_p025
+        new_low_span_inner = _get(p, 0.10) - _get(p, 0.05)
+        new_low_span_outer = _get(p, 0.05) - _get(p, 0.025)
+        assert new_low_span_outer > base_low_span_outer - 1e-12
+        # Inner span may adjust slightly; ensure it's still positive
+        assert new_low_span_inner > 0.0
+
+        base_p95, base_p975 = 97.0, 98.0
+        base_up_span_outer = base_p975 - base_p95
+        new_up_span_inner = _get(p, 0.95) - _get(p, 0.90)
+        new_up_span_outer = _get(p, 0.975) - _get(p, 0.95)
+        assert new_up_span_outer > base_up_span_outer - 1e-12
+        assert new_up_span_inner > 0.0
+
+        # Bounds respected and strictly increasing
+        vals = [pp.value for pp in p]
+        assert all(0.0 <= v <= 100.0 for v in vals)
+        assert all(b > a for a, b in pairwise(vals)), vals
+
+    @pytest.mark.parametrize(
+        ("open_lower", "open_upper"),
+        [
+            (False, True),  # lower-bounded
+            (True, False),  # upper-bounded
+        ],
+    )
+    def test_semibounded_open_cases(self, open_lower: bool, open_upper: bool):
+        L, U = 0.0, 100.0
+        q = _make_question(L, U, open_lower, open_upper)
+        base = _standard_percentiles([9, 10, 11, 13, 18, 30, 50, 70, 85, 92, 96, 98, 99])
+        out = widen_declared_percentiles(base, q, k_tail=1.3, tail_start=0.2, span_floor_gamma=0.0)
+        # Median unchanged; monotone; values clamped within numeric range
+        assert math.isclose(next(p.value for p in out if math.isclose(p.percentile, 0.5)), 50.0, abs_tol=1e-9)
+        vals = [pp.value for pp in out]
+        assert all(L <= v <= U for v in vals)
+        assert all(b > a for a, b in pairwise(vals)), vals
+
+    def test_span_floor_enforced(self):
+        q = _make_question(0.0, 100.0, False, False)
+        # Intentionally compressed outer tails vs inner spans
+        base = _standard_percentiles([6, 10, 10.4, 12.0, 16.0, 30.0, 50.0, 70.0, 85.0, 92.0, 95.0, 96.0, 99])
+        out = widen_declared_percentiles(base, q, k_tail=1.0, tail_start=0.2, span_floor_gamma=1.0)
+
+        def _get(ps, target):
+            return next(x.value for x in ps if math.isclose(x.percentile, target))
+
+        assert (_get(out, 0.05) - _get(out, 0.025)) >= (_get(out, 0.10) - _get(out, 0.05)) - 1e-12
+        assert (_get(out, 0.975) - _get(out, 0.95)) >= (_get(out, 0.95) - _get(out, 0.90)) - 1e-12
+        vals = [pp.value for pp in out]
+        assert all(b > a for a, b in pairwise(vals)), vals
+
+
+class TestTailWideningGoldenOutputs:
+    """Exact-output pins across every bound configuration and both knobs.
+
+    ``widen_declared_percentiles`` chains a transform-space stretch, two span-floor
+    passes, an outer-span guard, two strict-ordering passes, an open-bound nudge and a
+    forward/backward spacing schedule. The property tests above cover each rule in
+    isolation; these goldens pin the composition, so the chain can be restructured
+    without silently moving a published percentile. Values captured from the
+    implementation as of 2026-08-26.
+    """
+
+    SHAPES: ClassVar[dict[str, list[float]]] = {
+        "smooth": [4, 5, 6, 8, 12, 20, 50, 80, 90, 94, 97, 98, 99],
+        "compressed": [6, 10, 10.4, 12.0, 16.0, 30.0, 50.0, 70.0, 85.0, 92.0, 95.0, 96.0, 99],
+        "skewed": [0.5, 1, 2, 5, 15, 30, 45, 60, 78, 88, 93, 97, 98],
+    }
+
+    # (case, shape) -> expected values, in percentile order.
+    GOLDEN: ClassVar[dict[tuple[str, str], list[float]]] = {
+        ("closed_k13", "smooth"): [
+            1.65643538848544,
+            2.322604160398969,
+            3.322604160398969,
+            5.685589966598779,
+            12.000000000000002,
+            20.0,
+            50.0,
+            80.0,
+            89.99999999999999,
+            95.94671612068684,
+            98.60499083895746,
+            99.60499083895746,
+            99.72808931532293,
+        ],
+        ("closed_k13", "compressed"): [
+            2.8312719268432827,
+            5.874566459780891,
+            6.672637348931135,
+            9.184650187299086,
+            16.0,
+            30.0,
+            50.0,
+            70.0,
+            85.0,
+            94.31441003340122,
+            97.3582033231971,
+            98.3582033231971,
+            99.72808931532293,
+        ],
+        ("closed_k13", "skewed"): [
+            0.11757112979876375,
+            0.11767112979876375,
+            0.8816026014045131,
+            3.3699097521928727,
+            15.0,
+            30.0,
+            44.99999999999999,
+            60.0,
+            78.0,
+            91.06335548628063,
+            96.13519908313177,
+            99.9999,
+            100.0,
+        ],
+        ("closed_k13_g1", "smooth"): [
+            1.65643538848544,
+            1.65653538848544,
+            3.322604160398969,
+            5.685589966598779,
+            12.000000000000002,
+            20.0,
+            50.0,
+            80.0,
+            89.99999999999999,
+            95.94671612068684,
+            98.60499083895746,
+            99.9999,
+            100.0,
+        ],
+        ("closed_k13_g1", "compressed"): [
+            2.8312719268432827,
+            4.160624510563183,
+            6.672637348931135,
+            9.184650187299086,
+            16.0,
+            30.0,
+            50.0,
+            70.0,
+            85.0,
+            94.31441003340122,
+            97.3582033231971,
+            99.9999,
+            100.0,
+        ],
+        ("closed_k13_g1", "skewed"): [
+            0.11757112979876375,
+            0.11767112979876375,
+            0.8816026014045131,
+            3.3699097521928727,
+            15.0,
+            30.0,
+            44.99999999999999,
+            60.0,
+            78.0,
+            91.06335548628063,
+            96.13519908313177,
+            99.9999,
+            100.0,
+        ],
+        ("lower_bounded", "smooth"): [
+            1.9473348564889912,
+            2.7236343738867212,
+            3.7236343738867212,
+            6.077262343444526,
+            12.0,
+            20.0,
+            50.0,
+            80.00000000000001,
+            90.0,
+            99.99969999999999,
+            99.9998,
+            99.9999,
+            100.0,
+        ],
+        ("lower_bounded", "compressed"): [
+            3.2788224913488286,
+            6.554210325824594,
+            7.304619354433183,
+            9.687527142102299,
+            16.000000000000004,
+            30.000000000000004,
+            50.0,
+            70.0,
+            84.99999999999997,
+            99.99969999999999,
+            99.9998,
+            99.9999,
+            100.0,
+        ],
+        ("lower_bounded", "skewed"): [
+            0.1386790599048518,
+            0.1387790599048518,
+            0.9926335025786523,
+            3.596115466605833,
+            15.0,
+            30.000000000000004,
+            44.99999999999999,
+            60.00000000000001,
+            78.00000000000003,
+            97.31352310911664,
+            99.9998,
+            99.9999,
+            100.0,
+        ],
+        ("upper_bounded", "smooth"): [
+            9.999999999999999e-05,
+            0.00019999999999999998,
+            0.0003,
+            0.00039999999999999996,
+            12.0,
+            19.999999999999986,
+            50.0,
+            80.0,
+            90.0,
+            95.63455584082577,
+            98.40703847614559,
+            99.40703847614559,
+            99.6720606370437,
+        ],
+        ("upper_bounded", "compressed"): [
+            9.999999999999999e-05,
+            0.00019999999999999998,
+            0.0003,
+            4.212338163131406,
+            15.999999999999972,
+            30.0,
+            50.0,
+            70.0,
+            85.0,
+            93.92273765655547,
+            97.02168928238332,
+            98.02168928238332,
+            99.6720606370437,
+        ],
+        ("upper_bounded", "skewed"): [
+            9.999999999999999e-05,
+            0.00019999999999999998,
+            0.0003,
+            0.00039999999999999996,
+            15.000000000000028,
+            30.0,
+            44.99999999999999,
+            59.99999999999999,
+            78.0,
+            90.44998553195363,
+            95.5978636115771,
+            99.5978636115771,
+            99.5979636115771,
+        ],
+        ("both_open", "smooth"): [
+            9.999999999999999e-05,
+            0.00019999999999999998,
+            0.0003,
+            0.00039999999999999996,
+            8.959999999999994,
+            20.0,
+            50.0,
+            80.0,
+            93.2,
+            99.99969999999999,
+            99.9998,
+            99.9999,
+            100.0,
+        ],
+        ("both_open", "compressed"): [
+            9.999999999999999e-05,
+            0.00019999999999999998,
+            0.0003,
+            2.8800000000000026,
+            13.280000000000001,
+            30.0,
+            50.0,
+            70.0,
+            87.80000000000001,
+            99.99969999999999,
+            99.9998,
+            99.9999,
+            100.0,
+        ],
+        ("both_open", "skewed"): [
+            9.999999999999999e-05,
+            0.00019999999999999998,
+            0.0003,
+            0.00039999999999999996,
+            12.599999999999994,
+            30.0,
+            45.0,
+            60.0,
+            80.64,
+            98.32,
+            99.9998,
+            99.9999,
+            100.0,
+        ],
+        ("floor_only", "smooth"): [
+            3.9999999999999996,
+            4.0001,
+            6.0,
+            8.0,
+            12.0,
+            20.0,
+            50.0,
+            80.0,
+            90.0,
+            94.0,
+            97.0,
+            99.9999,
+            100.0,
+        ],
+        ("floor_only", "compressed"): [
+            6.0,
+            8.8,
+            10.4,
+            12.0,
+            16.0,
+            30.0,
+            50.0,
+            70.0,
+            85.0,
+            92.0,
+            95.0,
+            98.0,
+            99.0,
+        ],
+        ("floor_only", "skewed"): [
+            0.5,
+            0.5001,
+            2.0,
+            5.0,
+            15.0,
+            30.0,
+            45.0,
+            60.0,
+            78.0,
+            88.0,
+            93.0,
+            98.0,
+            98.0001,
+        ],
+    }
+
+    CASES: ClassVar[dict[str, tuple[dict[str, bool], dict[str, float]]]] = {
+        "closed_k13": (
+            {"open_lower": False, "open_upper": False},
+            {"k_tail": 1.3, "tail_start": 0.2, "span_floor_gamma": 0.0},
+        ),
+        "closed_k13_g1": (
+            {"open_lower": False, "open_upper": False},
+            {"k_tail": 1.3, "tail_start": 0.2, "span_floor_gamma": 1.0},
+        ),
+        "lower_bounded": (
+            {"open_lower": False, "open_upper": True},
+            {"k_tail": 1.3, "tail_start": 0.2, "span_floor_gamma": 0.0},
+        ),
+        "upper_bounded": (
+            {"open_lower": True, "open_upper": False},
+            {"k_tail": 1.3, "tail_start": 0.2, "span_floor_gamma": 0.0},
+        ),
+        "both_open": (
+            {"open_lower": True, "open_upper": True},
+            {"k_tail": 1.4, "tail_start": 0.25, "span_floor_gamma": 0.0},
+        ),
+        "floor_only": (
+            {"open_lower": False, "open_upper": False},
+            {"k_tail": 1.0, "tail_start": 0.2, "span_floor_gamma": 1.0},
+        ),
+    }
+
+    @pytest.mark.parametrize("case_name", list(CASES))
+    @pytest.mark.parametrize("shape_name", list(SHAPES))
+    def test_golden_output(self, case_name: str, shape_name: str):
+        question_kwargs, widen_kwargs = self.CASES[case_name]
+        question = _make_question(0.0, 100.0, **question_kwargs)
+        base = _standard_percentiles(self.SHAPES[shape_name])
+
+        out = widen_declared_percentiles(base, question, **widen_kwargs)
+
+        assert [p.percentile for p in out] == [p.percentile for p in base]
+        expected = self.GOLDEN[case_name, shape_name]
+        for got, want in zip((p.value for p in out), expected, strict=True):
+            assert got == pytest.approx(want, rel=1e-12, abs=1e-12)
+
+
+class TestTailWideningIntegration:
+    @pytest.mark.asyncio
+    async def test_integration_discrete_enabled(self, monkeypatch):
+        # Enable tail widening globally for this test
+        from metaculus_bot.numeric import config as cfg
+
+        monkeypatch.setattr(cfg, "TAIL_WIDENING_ENABLE", True, raising=False)
+        monkeypatch.setattr(cfg, "TAIL_WIDEN_K_TAIL", 1.35, raising=False)
+        monkeypatch.setattr(cfg, "TAIL_WIDEN_TAIL_START", 0.2, raising=False)
+        monkeypatch.setattr(cfg, "TAIL_WIDEN_SPAN_FLOOR_GAMMA", 1.0, raising=False)
+
+        from main import TemplateForecaster
+
+        bot = TemplateForecaster(
+            llms={
+                "default": MagicMock(),
+                "parser": MagicMock(),
+                "researcher": MagicMock(),
+                "summarizer": MagicMock(),
+            },
+            publish_reports_to_metaculus=False,
+        )
+
+        # Minimal numeric question with discrete cdf_size — CDF should be resampled to cdf_size
+        nq = SimpleNamespace(
+            question_text="num?",
+            background_info="",
+            resolution_criteria="",
+            fine_print="",
+            unit_of_measure=None,
+            open_upper_bound=False,
+            open_lower_bound=False,
+            lower_bound=0.0,
+            upper_bound=100.0,
+            page_url="url",
+            api_json={"question": {}},
+            zero_point=None,
+            id_of_question=4242,
+            cdf_size=101,
+            open_time=_stub_open_time(),
+            scheduled_resolution_time=_stub_resolve_time(),
+        )
+
+        # Compressed tails baseline
+        baseline_vals = [9, 10, 11, 13, 18, 30, 50, 70, 85, 92, 95, 96, 97]
+        declared = _standard_percentiles(baseline_vals)
+
+        llm = MagicMock()
+        llm.model = "m"
+        llm.invoke = AsyncMock(return_value="rationale")
+
+        with (
+            patch(
+                "metaculus_bot.forecaster_runners.parse_structured",
+                return_value=OutcomeTypeResult(is_discrete_integer=False),
+            ),
+            patch(
+                "metaculus_bot.forecaster_runners.extract_numeric",
+                new=AsyncMock(return_value=ExtractionOutcome(value=declared, rung="block", block_present=True)),
+            ),
+        ):
+            result = await bot._run_forecast_on_numeric(cast(NumericQuestion, nq), "", llm)
+
+        # Ensure declared percentiles changed (tails widened)
+        out_decl = [p.value for p in result.prediction_value.declared_percentiles]  # type: ignore[attr-defined]
+        assert out_decl[0] <= baseline_vals[0] - 1e-6 or out_decl[-1] >= baseline_vals[-1] + 1e-6
+
+        # CDF is produced and monotone
+        cdf = result.prediction_value.cdf  # type: ignore[attr-defined]
+        probs = [p.percentile for p in cdf]
+        assert len(cdf) == 101
+        assert all(a <= b for a, b in pairwise(probs))

@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd job: weekly research-archive sync.
+
+  Pulls GHA research artifacts into backtests/research_archive/ before they expire
+  (GHA retention-days: 90). Weekly cadence leaves wide margin inside the 90-day window.
+
+  TEMPLATE — not installable as-is. Every __REPO_ROOT__ below stands for the absolute path
+  to your checkout; launchd has no notion of a repo-relative path, so it must be substituted
+  before install. README.md's install step does that with a one-line sed. Only this template
+  is committed: the generated .plist is machine-specific and gitignored.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.metaculusbot.research-sync</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__REPO_ROOT__/scripts/research_sync/run_sync.sh</string>
+    </array>
+
+    <!-- TWO wakes a week (Sun + Wed 03:00 local), not one. launchd runs a job missed
+         while asleep at the next wake, which is exactly when Wi-Fi has not
+         re-associated — every scheduled run from 2026-06-28 to 2026-07-26 died on that
+         race. run_sync.sh now waits up to 5 min for the network, and this second wake
+         is the backstop for the case it still can't get online: a bad wake then costs
+         half a week rather than the whole one. Both wakes are idempotent (every archive
+         build is replace-by-run), so the extra run is free apart from GitHub API reads. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Weekday</key>
+            <integer>0</integer>
+            <key>Hour</key>
+            <integer>3</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key>
+            <integer>3</integer>
+            <key>Hour</key>
+            <integer>3</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+    </array>
+
+    <!-- Don't let launchd relaunch the job in a tight loop after a non-zero exit (which
+         run_sync.sh now returns on failure — see report_failure). 1 hour is long enough
+         that a transient network outage gets a genuine retry without hammering. -->
+    <key>ThrottleInterval</key>
+    <integer>3600</integer>
+
+    <!-- launchd's own stdout/stderr for the job (separate from run_sync.sh's dated
+         logfiles). Useful for diagnosing a job that never starts. -->
+    <key>StandardOutPath</key>
+    <string>__REPO_ROOT__/scripts/research_sync/logs/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__REPO_ROOT__/scripts/research_sync/logs/launchd.err.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

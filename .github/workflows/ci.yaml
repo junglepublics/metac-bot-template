@@ -1,0 +1,99 @@
+---
+name: CI
+
+"on":
+  push:
+    branches: [main]
+  pull_request:
+
+# Every job carries timeout-minutes. Without it the cap is GitHub's default 360, so a
+# hung `uv sync`, a stalled container pull or a wedged pytest leaves a required check
+# spinning for six hours — the same uncapped-network-step shape that burned four
+# 300-minute bot runs on 2026-08-19. Caps are >=5x the worst of 131 successful CI jobs
+# (whole job max 245s, pytest 225s, basedpyright 27s, uv sync 15s, osv pull 16s);
+# receipts in scratch/residual_2026-08-24/track_c_step_timings.json.
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --dev --frozen
+      # Keep CI on the reviewed lockfile, without resolving dependencies.
+      - run: uv run --frozen ruff check .
+      - run: uv run --frozen ruff format --check .
+      - run: uv run --frozen basedpyright
+      # Dependency hygiene. This job is the only place the misplaced-dev-dependency class
+      # can be caught: the job installs --dev, the bot workflows install --no-dev, so a
+      # dev-only package imported by metaculus_bot/ is green in every test here and a
+      # ModuleNotFoundError on the next scheduled run. Per-rule ignores and their
+      # justifications live in [tool.deptry] in pyproject.toml.
+      - run: uv run --frozen deptry .
+      # Import-direction contracts ([tool.importlinter] in pyproject.toml). Both steps are
+      # sub-second, so neither moves this job's timeout-minutes budget.
+      - run: uv run --frozen lint-imports
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # test_performance_analysis_eras.py pins each config-era boundary to its merge
+          # commit's committer timestamp, and skips itself when the object is absent; the
+          # default shallow fetch would silently drop the whole gate. 23 MB of history.
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --dev --frozen
+      - name: Run tests
+        run: uv run --frozen pytest --cov=metaculus_bot
+
+  # Secret scan. This repo is a public fork, so a committed credential is exposed the
+  # moment it lands, and nothing in pre-commit or CI caught that before. Findings are
+  # redacted in the SARIF artifact the action uploads.
+  secret_scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # The action scans a commit RANGE (`<base>^..<head>`), so the base commit's
+          # parent has to be in the clone; the default shallow fetch breaks it.
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Pin the CLI. The action's own default is 8.24.3, which predates the
+          # [[allowlists]] schema .gitleaks.toml uses and would silently ignore the
+          # whole allowlist, drowning the job in fixture false positives.
+          GITLEAKS_VERSION: '8.30.1'
+          GITLEAKS_CONFIG: .gitleaks.toml
+          # PR review comments would need pull-requests: write; the job summary and the
+          # non-zero exit are signal enough, so keep the token read-only.
+          GITLEAKS_ENABLE_COMMENTS: 'false'
+      # No GITLEAKS_LICENSE above: the action requires one only for repos owned by an
+      # organization. It resolves that by looking up the owner's account type, so this
+      # stays license-free only while the repo lives under a personal account.
+
+  # Scan uv.lock for known vulnerabilities. osv-scanner is a Go binary (not a
+  # PyPI package), so it runs via Google's published container action rather
+  # than uvx.
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: google/osv-scanner-action/osv-scanner-action@v2.3.8
+        with:
+          scan-args: |-
+            --config=osv-scanner.toml
+            --lockfile=uv.lock

@@ -1,67 +1,52 @@
 # Architecture
 
-**Status:** draft agreed in principle by Prateek, 12 November 2026. Bayesian framing added at his request, 13 November 2026. Nothing below is built yet. The bot still runs the plain template.
+**Status:** agreed in principle by Prateek, 12 November 2026. Bayesian framing added 13 November 2026. On 13 November 2026 Prateek chose to build on nostreambot's code (https://github.com/No-Stream/metaculus-bot, MIT licence, 15th of 277 in Summer 2026). Corrected the same day against nostreambot's tested results (see `proposals/2026-11-13-open-source-bots-review.md`).
 
-**The idea in one line:** start from the best prior available, update only on real evidence, then check the updates against reality.
+This page is Prateek's view of the bot. The code-level walk-through is `docs/architecture.md`. What was tried, and why it was kept or dropped, is in `FUTURE.md`.
+
+**The idea in one line:** start from the best prior available, update only on real evidence, then publish the median of independent forecasts.
 
 ```
-Scheduler (GitHub Actions, every 20 min, main branch only)
+Scheduler (GitHub Actions + an outside trigger, main branch only)
   -> Fetch open questions
-  -> 1. Read the question     what exactly counts as YES
+  -> 1. Read the question     what exactly counts as YES; open the resolution source
   -> 2. Prior                 the best starting number we can find
-  -> 3. Update                move it only for real new evidence
-  -> 4. Correct               fix the bot's measured biases
-  -> Post forecast + short reasoning comment
-  -> Log everything to data/forecasts.jsonl
+  -> 3. Update                independent forecasters move it only for real evidence
+  -> 4. Combine               median of the forecasters; cap extremes
+  -> Post forecast + reasoning comment
+  -> Log everything
 ```
 
 ## 1. Read the question
-Restate the resolution criteria: what counts as YES, the resolution source, the deadline and the edge cases. Every later step works from this restatement, not from the raw question text. Misreading the question is the cheapest way to lose points.
+Restate the resolution criteria: what counts as YES, the resolution source, the deadline and the edge cases. A fetcher opens the pages the question names as its resolution source. Misreading the question is the cheapest way to lose points.
 
 ## 2. Prior
-Find the best starting number, in this order:
-1. A prediction market price (Polymarket, Kalshi, Manifold), but only when both conditions hold:
-   - the market is liquid enough that a few traders cannot set the price (Manifold's play money counts for less);
-   - its resolution rules match the question. A market on a different question is not a prior for this one.
+The shared research gathers the best starting number:
+1. A prediction market price (Polymarket, Kalshi, Manifold, PredictIt), but only when the market is liquid and its rules match the question. Thin markets count for less. Prateek chose this on 13 November 2026.
+2. For numeric questions, the history of the matching data series (FRED, yfinance) as an anchor.
+3. Otherwise, a base rate from a reference class, applied only to the time left before the deadline.
 
-   Markets are known to overprice long shots, and long-dated ones sit too close to 50%. The update step may correct for both. Prateek chose this option on 13 November 2026, with the conditions.
-2. For numeric questions, a prior distribution from a simple statistical model of the historical data, such as FRED.
-3. Otherwise, a base rate from a reference class, scaled to the time left before the deadline.
-
-The prior and its source are written into the research brief. Most of the accuracy should come from this step.
+Research also comes from AskNews and native web search. Every claim is tagged by source quality, A to D. Two gap-fill passes look for facts the first round missed.
 
 ## 3. Update
-Five forecasters, from different model families, each read the prior, the news and the status quo ("what happens if nothing changes?"). Each one says whether to move away from the prior, by how much and why. The burden of proof is on moving, not on staying.
+Several forecasters, from different model families, read the same shared research. Each forecasts on its own. A move of more than about 15 points from a computed number needs a named, specific piece of evidence. This is a rule in the prompt, not a clamp: a hard clamp was tested by nostreambot and hurt.
 
-The five forecasts are combined on the odds scale: average their log-odds, then push the result slightly away from 50% ("extremising"). This has beaten the plain median in research on combining forecasters (Satopää and colleagues; the Good Judgment Project). The plain median stays available as a setting, so the two can be compared.
+## 4. Combine
+The published forecast is the median of the forecasters. For numeric questions, the median is taken point by point on the full distribution. Binary forecasts are capped at 1% and 99%. Multiple choice gets a small floor on every option.
 
-For numeric questions, the update shifts or widens the prior distribution.
-
-## 4. Correct
-Correct the bot's raw numbers for biases measured on resolved questions, for example "says 80% but is right 70% of the time". The correction is Bayesian: it stays close to "no change" until the test data clearly shows a bias, so a small sample does not make it chase noise. Cap binary forecasts at 1% and 99%. For multiple choice, give every option a small floor. For numeric, run the distribution through the package's CDF standardisation.
+**Dropped after the evidence:** calibrating the bot's numbers afterwards, and pooling on the odds scale. nostreambot tested both, along with several other methods, and none beat the plain median. The bias flips sign between seasons, so a correction fitted on one season hurts the next.
 
 ## What holds it together
-**A test set of resolved questions**, with news searches limited to before each question opened. Every step is a separate module switched on in `config/pipeline.yaml`. Each configuration has a name (for example `v0-template`, `v1-spine`). A step stays only if it improves the score on the test set.
+**Tests on resolved questions.** Each change is a named variant, run on resolved questions with nothing posted, and kept only if it improves the score. The comparison is reported as a Bayesian estimate: "about an 85% chance v1 is better". Near 50% means the sample is too small to tell.
 
-Variants are compared with a Bayesian estimate of the difference in score. The report says "about an 85% chance v1 is better than v0", not just "v1 scored better". When the chance is near 50%, the report says the sample is too small to tell.
-
-## Build order
-1. `v0-template`: the plain template, to get a baseline score.
-2. `v1-spine`: steps 1 to 4 above, with log-odds pooling and Bayesian calibration.
-3. `v2-bayes-update`: in step 3, each forecaster updates in odds, one piece of evidence at a time. It asks how much more likely each piece of evidence is if YES is true than if NO is true. Related news is grouped by underlying fact first, so the same event is not counted twice. The total move away from the prior is capped. Tested against v1's free-form update, because LLMs are poor at putting numbers on these ratios.
-4. Later variants, one change at a time, only to fix a problem the tests show.
-
-## Not planned
-A full formal Bayesian model of each question, such as a network of linked causes. It would be slow and fragile, and the LLM would be inventing most of the numbers.
+## Variants to test, in order
+1. `v0-nostream`: nostreambot as it is, to get our baseline.
+2. `v1-load-bearing`: each forecaster names the claims its forecast rests on. The worst misses come when every model trusts one wrong fact in the shared research. This is nostreambot's best-supported next idea, and close to our keystone idea.
+3. `v2-bayes-update`: each forecaster updates in odds, one piece of evidence at a time, with related news grouped first so it is not counted twice.
 
 ## Parked ideas
-These address problems we have not measured yet. Each gets built as a named variant only if the tests show the problem it fixes.
-- Fizzle rate as its own step (now part of the status quo check).
-- Evidence grades: evidenced, assumed, contested.
-- Keystone assumption, for questions with several conditions.
-- A primary-source check on key figures.
-- A forecaster that argues against the others.
+Each gets built as a named variant only if the tests show the problem it fixes.
+- Fizzle rate as its own step.
+- Evidence grades (partly covered by source tiers).
+- A forecaster that argues against the others. nostreambot found advisory critics never moved the number.
 - Wider tails on numeric questions.
-- Spending more on hard questions.
-
-Several of these come from Dark Matter Labs' risk work. See `proposals/2026-11-13-v1-spine.md`.

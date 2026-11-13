@@ -1,0 +1,415 @@
+"""Lightweight smoke tests for community_benchmark.py to catch common issues."""
+
+import asyncio
+from typing import Any
+from unittest.mock import AsyncMock, Mock, patch
+
+import pytest
+
+import community_benchmark
+from community_benchmark import _build_parser
+
+
+def test_import_community_benchmark() -> None:
+    """Importing the module must not raise (it does real work at module scope).
+
+    The body asserts on the imported module rather than just importing it: an
+    import-only body is an unused import, and Ruff's autofix DELETED it in
+    ``4ac46cc`` ("ruff reformat all"), leaving this test with an empty body that
+    passed unconditionally for ~11 months. Binding the module and asserting a
+    known attribute keeps the import live, so the formatter has no reason to
+    remove it and the test cannot silently become a no-op again.
+    """
+    assert callable(community_benchmark.benchmark_forecast_bot)
+
+
+def test_cli_argument_parsing() -> None:
+    """The executable parser exposes the current mode and model-filter options."""
+    parser = _build_parser()
+    defaults = parser.parse_args([])
+    assert defaults.mode == "display"
+    assert defaults.num_questions == 2
+    assert defaults.mixed is False
+    assert defaults.include_models is None
+    assert defaults.exclude_models is None
+
+    args = parser.parse_args(
+        [
+            "--mode",
+            "custom",
+            "--num-questions",
+            "5",
+            "--mixed",
+            "--include-models",
+            "gpt",
+            "qwen",
+        ]
+    )
+    assert args.mode == "custom"
+    assert args.num_questions == 5
+    assert args.mixed is True
+    assert args.include_models == ["gpt", "qwen"]
+
+    args = parser.parse_args(["--mode", "run", "--exclude-models", "grok"])
+    assert args.mode == "run"
+    assert args.exclude_models == ["grok"]
+
+
+def test_bot_instantiation():
+    """Test that benchmark bots can be created with the new ensemble configuration."""
+    from forecasting_tools import GeneralLlm
+
+    from main import TemplateForecaster
+    from metaculus_bot.aggregation_strategies import AggregationStrategy
+    from metaculus_bot.llm_configs import PARSER_LLM, RESEARCHER_LLM, SUMMARIZER_LLM
+
+    # Test single model bot (equivalent to new baseline configurations).
+    # `llms` accepts a "forecasters" list[GeneralLlm] at runtime (see prepare_llm_config),
+    # which is broader than the declared param type; annotate as dict[str, Any] so the splat type-checks.
+    single_bot_llms: dict[str, Any] = {
+        "forecasters": [
+            GeneralLlm(
+                model="openrouter/qwen/qwen3-235b-a22b-thinking-2507",
+                temperature=0.0,
+                top_p=0.9,
+                max_tokens=16000,
+                stream=False,
+                timeout=480,
+                allowed_tries=3,
+            )
+        ],
+        "summarizer": SUMMARIZER_LLM,
+        "parser": PARSER_LLM,
+        "researcher": RESEARCHER_LLM,
+    }
+    single_bot = TemplateForecaster(
+        research_reports_per_question=1,
+        predictions_per_research_report=1,
+        publish_reports_to_metaculus=False,
+        folder_to_save_reports_to=None,
+        skip_previously_forecasted_questions=False,
+        aggregation_strategy=AggregationStrategy.MEAN,  # Unused for single model
+        research_provider=None,
+        max_questions_per_run=None,
+        llms=single_bot_llms,
+    )
+
+    # Two-model ensemble config reused for both the mean- and median-aggregation bots.
+    ensemble_llms: dict[str, Any] = {
+        "forecasters": [
+            GeneralLlm(
+                model="openrouter/qwen/qwen3-235b-a22b-thinking-2507",
+                temperature=0.0,
+                top_p=0.9,
+                max_tokens=16000,
+                stream=False,
+                timeout=480,
+                allowed_tries=3,
+            ),
+            GeneralLlm(
+                model="openrouter/z-ai/glm-4.5",
+                temperature=0.0,
+                top_p=0.9,
+                max_tokens=16000,
+                stream=False,
+                timeout=480,
+                allowed_tries=3,
+            ),
+        ],
+        "summarizer": SUMMARIZER_LLM,
+        "parser": PARSER_LLM,
+        "researcher": RESEARCHER_LLM,
+    }
+
+    # Test ensemble bot with mean aggregation
+    ensemble_mean_bot = TemplateForecaster(
+        research_reports_per_question=1,
+        predictions_per_research_report=1,
+        publish_reports_to_metaculus=False,
+        folder_to_save_reports_to=None,
+        skip_previously_forecasted_questions=False,
+        aggregation_strategy=AggregationStrategy.MEAN,
+        research_provider=None,
+        max_questions_per_run=None,
+        llms=ensemble_llms,
+    )
+
+    # Test ensemble bot with median aggregation
+    ensemble_median_bot = TemplateForecaster(
+        research_reports_per_question=1,
+        predictions_per_research_report=1,
+        publish_reports_to_metaculus=False,
+        folder_to_save_reports_to=None,
+        skip_previously_forecasted_questions=False,
+        aggregation_strategy=AggregationStrategy.MEDIAN,
+        research_provider=None,
+        max_questions_per_run=None,
+        llms=ensemble_llms,
+    )
+
+    # Verify bots have required attributes
+    for bot in [single_bot, ensemble_mean_bot, ensemble_median_bot]:
+        assert hasattr(bot, "research_provider")
+        assert hasattr(bot, "max_questions_per_run")
+        assert hasattr(bot, "aggregation_strategy")
+        assert bot.max_questions_per_run is None
+
+    # Verify aggregation strategies are set correctly
+    assert single_bot.aggregation_strategy == AggregationStrategy.MEAN  # Default for single model
+    assert ensemble_mean_bot.aggregation_strategy == AggregationStrategy.MEAN
+    assert ensemble_median_bot.aggregation_strategy == AggregationStrategy.MEDIAN
+
+
+@patch("community_benchmark.run_benchmark_streamlit_page")
+def test_display_mode(mock_streamlit):
+    """Test that display mode calls streamlit and returns early."""
+    import community_benchmark
+
+    # Mock streamlit function to avoid actually launching UI
+    mock_streamlit.return_value = None
+
+    # Run display mode
+    asyncio.run(community_benchmark.benchmark_forecast_bot("display", 5))
+
+    # Verify streamlit was called and function returned early
+    mock_streamlit.assert_called_once()
+
+
+@patch("community_benchmark.verify_metaculus_api_identity")
+@patch("community_benchmark.MetaculusApi.get_questions_matching_filter")
+@patch("community_benchmark.Benchmarker")
+@patch("community_benchmark.MonetaryCostManager")
+def test_benchmark_flow_without_api_calls(
+    mock_cost_manager, mock_benchmarker_class, mock_get_questions_filter, mock_verify
+):
+    """Test benchmark flow without making actual API calls."""
+    import community_benchmark
+
+    # Mock API calls to prevent actual requests
+    mock_get_questions_filter.return_value = []
+
+    # Mock benchmarker
+    mock_benchmarker = Mock()
+    mock_benchmarker.run_benchmark = AsyncMock(return_value=[])
+    mock_benchmarker_class.return_value = mock_benchmarker
+
+    # Mock cost manager
+    mock_cost_manager_instance = Mock()
+    mock_cost_manager_instance.__enter__ = Mock(return_value=mock_cost_manager_instance)
+    mock_cost_manager_instance.__exit__ = Mock(return_value=None)
+    mock_cost_manager_instance.current_usage = "Mock Cost"
+    mock_cost_manager.return_value = mock_cost_manager_instance
+
+    # Test that function can run without errors
+    asyncio.run(community_benchmark.benchmark_forecast_bot("run", 1))
+
+    # Verify get_questions_matching_filter was called with randomly_sample=False
+    mock_get_questions_filter.assert_called_once()
+    call_kwargs = mock_get_questions_filter.call_args
+    assert call_kwargs.kwargs.get("randomly_sample") is False or call_kwargs[1].get("randomly_sample") is False
+    mock_benchmarker.run_benchmark.assert_called_once()
+    mock_verify.assert_called_once()  # the run path preflights before fetching
+
+
+@patch("community_benchmark.verify_metaculus_api_identity")
+@patch("community_benchmark.MetaculusApi.get_questions_matching_filter")
+@patch("community_benchmark.Benchmarker")
+@patch("community_benchmark.MonetaryCostManager")
+def test_custom_mode_without_api_calls(
+    mock_cost_manager, mock_benchmarker_class, mock_get_questions_filter, mock_verify
+):
+    """Test custom mode flow without making actual API calls."""
+    import community_benchmark
+
+    # Mock API calls
+    mock_get_questions_filter.return_value = []  # Empty question list
+
+    # Mock benchmarker
+    mock_benchmarker = Mock()
+    mock_benchmarker.run_benchmark = AsyncMock(return_value=[])
+    mock_benchmarker_class.return_value = mock_benchmarker
+
+    # Mock cost manager
+    mock_cost_manager_instance = Mock()
+    mock_cost_manager_instance.__enter__ = Mock(return_value=mock_cost_manager_instance)
+    mock_cost_manager_instance.__exit__ = Mock(return_value=None)
+    mock_cost_manager_instance.current_usage = "Mock Cost"
+    mock_cost_manager.return_value = mock_cost_manager_instance
+
+    # Test custom mode
+    asyncio.run(community_benchmark.benchmark_forecast_bot("custom", 3))
+
+    # Verify mocked functions were called
+    mock_get_questions_filter.assert_called_once()
+    mock_benchmarker.run_benchmark.assert_called_once()
+    mock_verify.assert_called_once()  # the custom path preflights before fetching
+
+
+def test_invalid_mode_raises_error():
+    """Test that invalid mode raises ValueError."""
+    import community_benchmark
+
+    with pytest.raises(ValueError, match="Invalid mode: invalid_mode"):
+        asyncio.run(community_benchmark.benchmark_forecast_bot("invalid_mode", 1))
+
+
+@patch("community_benchmark.MetaculusApi.get_questions_matching_filter")
+def test_mixed_question_types_distribution(mock_get_questions_filter):
+    """Test that mixed question type distribution works correctly."""
+    from datetime import datetime, timedelta
+
+    import community_benchmark
+
+    # Mock return values for different question types
+    def mock_filter_side_effect(api_filter, num_questions, randomly_sample):
+        # Return different mock questions based on allowed_types
+        question_type = api_filter.allowed_types[0] if api_filter.allowed_types else "binary"
+        mock_questions = []
+        for i in range(num_questions):
+            mock_question = Mock()
+            mock_question.background_info = f"Mock {question_type} question {i}"
+            mock_question.question_text = (
+                f"Mock {question_type} question text {i} - this is a sample question for testing purposes"
+            )
+            mock_questions.append(mock_question)
+        return mock_questions
+
+    mock_get_questions_filter.side_effect = mock_filter_side_effect
+
+    # Test with 12 questions to get nice distribution
+    one_year_from_now = datetime.now() + timedelta(days=365)
+    questions = asyncio.run(community_benchmark._get_mixed_question_types(12, one_year_from_now))
+
+    # Should have called the API 3 times (binary, numeric, multiple_choice)
+    assert mock_get_questions_filter.call_count == 3
+
+    # Should have roughly 50/25/25 distribution: 6/3/3
+    assert len(questions) == 12
+
+    # Verify all questions had background_info cleared
+    for question in questions:
+        assert question.background_info is None
+
+
+def test_individual_model_bot_generation():
+    """Test that the new individual model configuration generates the expected bots."""
+    from metaculus_bot.benchmark.bot_factory import (
+        BENCHMARK_BOT_CONFIG,
+        DEFAULT_HELPER_LLMS,
+        INDIVIDUAL_MODEL_SPECS,
+        STACKING_MODEL_SPECS,
+        create_individual_bots,
+        create_stacking_bots,
+    )
+
+    research_cache: dict[int, str] = {}
+
+    individual_bots = create_individual_bots(
+        INDIVIDUAL_MODEL_SPECS,
+        DEFAULT_HELPER_LLMS,
+        BENCHMARK_BOT_CONFIG,
+        batch_size=1,
+        research_cache=research_cache,
+    )
+
+    stacking_bots = create_stacking_bots(
+        STACKING_MODEL_SPECS,
+        [spec["forecaster"] for spec in INDIVIDUAL_MODEL_SPECS],
+        DEFAULT_HELPER_LLMS,
+        BENCHMARK_BOT_CONFIG,
+        batch_size=1,
+        research_cache=research_cache,
+    )
+
+    expected_individual_names = [spec["name"] for spec in INDIVIDUAL_MODEL_SPECS]
+    expected_stacking_names = [spec["name"] for spec in STACKING_MODEL_SPECS]
+
+    # `name` is a dynamic attribute set by the bot factory (bot_factory.py), not declared on TemplateForecaster.
+    assert [bot.name for bot in individual_bots] == expected_individual_names  # pyright: ignore[reportAttributeAccessIssue]
+    assert [bot.name for bot in stacking_bots] == expected_stacking_names  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def test_benchmark_config_constants_remain_unchanged_after_bot_creation():
+    """Ensure helper constants are stable when used to create bots."""
+    from metaculus_bot.benchmark.bot_factory import (
+        BENCHMARK_BOT_CONFIG,
+        DEFAULT_HELPER_LLMS,
+        INDIVIDUAL_MODEL_SPECS,
+        STACKING_MODEL_SPECS,
+        create_individual_bots,
+        create_stacking_bots,
+    )
+
+    individual_names_before = [spec["name"] for spec in INDIVIDUAL_MODEL_SPECS]
+    stacking_names_before = [spec["name"] for spec in STACKING_MODEL_SPECS]
+
+    research_cache: dict[int, str] = {}
+
+    create_individual_bots(
+        INDIVIDUAL_MODEL_SPECS,
+        DEFAULT_HELPER_LLMS,
+        BENCHMARK_BOT_CONFIG,
+        batch_size=1,
+        research_cache=research_cache,
+    )
+
+    create_stacking_bots(
+        STACKING_MODEL_SPECS,
+        [spec["forecaster"] for spec in INDIVIDUAL_MODEL_SPECS],
+        DEFAULT_HELPER_LLMS,
+        BENCHMARK_BOT_CONFIG,
+        batch_size=1,
+        research_cache=research_cache,
+    )
+
+    assert [spec["name"] for spec in INDIVIDUAL_MODEL_SPECS] == individual_names_before
+    assert [spec["name"] for spec in STACKING_MODEL_SPECS] == stacking_names_before
+
+
+@patch("community_benchmark.verify_metaculus_api_identity")
+@patch("community_benchmark.MetaculusApi.get_questions_matching_filter")
+@patch("community_benchmark.Benchmarker")
+@patch("community_benchmark.MonetaryCostManager")
+def test_custom_mode_with_mixed_flag(mock_cost_manager, mock_benchmarker_class, mock_get_questions_filter, mock_verify):
+    """Test custom mode with mixed flag uses mixed question types."""
+    import community_benchmark
+
+    # Mock return values for different question types
+    def mock_filter_side_effect(api_filter, num_questions, randomly_sample):
+        mock_questions = []
+        for i in range(num_questions):
+            mock_question = Mock()
+            mock_question.background_info = "test"
+            mock_question.question_text = f"Mock question text {i} - this is a sample question for testing purposes"
+            mock_questions.append(mock_question)
+        return mock_questions
+
+    mock_get_questions_filter.side_effect = mock_filter_side_effect
+
+    # Mock benchmarker
+    mock_benchmarker = Mock()
+    mock_benchmarker.run_benchmark = AsyncMock(return_value=[])
+    mock_benchmarker_class.return_value = mock_benchmarker
+
+    # Mock cost manager
+    mock_cost_manager_instance = Mock()
+    mock_cost_manager_instance.__enter__ = Mock(return_value=mock_cost_manager_instance)
+    mock_cost_manager_instance.__exit__ = Mock(return_value=None)
+    mock_cost_manager_instance.current_usage = "Mock Cost"
+    mock_cost_manager.return_value = mock_cost_manager_instance
+
+    # Test custom mode with mixed flag
+    asyncio.run(community_benchmark.benchmark_forecast_bot("custom", 6, mixed_types=True))
+
+    # Should call API 3 times for mixed types (binary, numeric, multiple_choice)
+    assert mock_get_questions_filter.call_count == 3
+
+    # Test custom mode without mixed flag (should call API once)
+    mock_get_questions_filter.reset_mock()
+    asyncio.run(community_benchmark.benchmark_forecast_bot("custom", 6, mixed_types=False))
+
+    # Should call API only once for binary questions
+    assert mock_get_questions_filter.call_count == 1
+
+    # Both custom runs preflight the API identity before fetching.
+    assert mock_verify.call_count == 2

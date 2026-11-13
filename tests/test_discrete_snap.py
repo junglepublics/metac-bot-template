@@ -1,0 +1,794 @@
+"""Comprehensive tests for discrete integer CDF snapping.
+
+Tests cover:
+  - Core snapping algorithm (step shape, PMF conservation, monotonicity, min/max step)
+  - Boundary handling (open/closed)
+  - Edge cases (high-PMF integer, many integers, single integer, log-scaled)
+  - Vote parsing and majority logic
+  - Round-trip validation against Metaculus constraints
+"""
+
+import logging
+from typing import ClassVar
+
+import numpy as np
+import pytest
+from forecasting_tools import GeneralLlm
+from forecasting_tools.data_models.numeric_report import NumericDistribution, Percentile
+from forecasting_tools.data_models.questions import DiscreteQuestion, NumericQuestion
+
+from main import TemplateForecaster
+from metaculus_bot.backtest.scoring import numeric_log_score
+from metaculus_bot.constants import DISCRETE_SNAP_MAX_INTEGERS, NUM_MAX_STEP, NUM_MIN_PROB_STEP
+from metaculus_bot.numeric.discrete_snap import (
+    OutcomeTypeResult,
+    majority_votes_discrete,
+    snap_cdf_to_integers,
+    snap_distribution_to_integers,
+)
+from metaculus_bot.numeric.pchip_processing import _validate_pchip_cdf, create_pchip_numeric_distribution
+
+
+def _make_question(
+    lower_bound: float = 0.0,
+    upper_bound: float = 10.0,
+    open_lower: bool = False,
+    open_upper: bool = False,
+    zero_point: float | None = None,
+    cdf_size: int = 201,
+) -> NumericQuestion:
+    return NumericQuestion(
+        id_of_question=999,
+        id_of_post=999,
+        page_url="https://example.com/q/999",
+        question_text="Test numeric question",
+        background_info="",
+        resolution_criteria="",
+        fine_print="",
+        published_time=None,
+        close_time=None,
+        lower_bound=lower_bound,
+        upper_bound=upper_bound,
+        open_lower_bound=open_lower,
+        open_upper_bound=open_upper,
+        unit_of_measure="",
+        zero_point=zero_point,
+        cdf_size=cdf_size,
+    )
+
+
+def _make_smooth_cdf(lower_bound: float, upper_bound: float, center: float, spread: float) -> list[float]:
+    """Generate a smooth sigmoid-like 201-point CDF centered at `center`."""
+    x = np.linspace(lower_bound, upper_bound, 201)
+    # Logistic CDF
+    cdf = 1.0 / (1.0 + np.exp(-(x - center) / spread))
+    # Pin endpoints for closed bounds
+    cdf[0] = 0.0
+    cdf[-1] = 1.0
+    # Ensure strictly increasing
+    min_step = NUM_MIN_PROB_STEP * 1.1
+    for i in range(1, len(cdf)):
+        if cdf[i] - cdf[i - 1] < min_step:
+            cdf[i] = cdf[i - 1] + min_step
+    cdf = np.clip(cdf, 0.0, 1.0)
+    cdf[-1] = 1.0
+    return cdf.tolist()
+
+
+# =============================================================================
+# Core Algorithm Tests
+# =============================================================================
+
+
+class TestSnapCdfToIntegers:
+    def test_basic_step_shape(self):
+        """Snapped CDF concentrates more mass at integer grid points than smooth CDF."""
+        cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=2.0)
+        result = snap_cdf_to_integers(cdf, 0.0, 10.0, open_lower_bound=False, open_upper_bound=False)
+        assert result is not None
+        assert len(result) == 201
+
+        # Mass concentrated at integers makes the step sizes far less uniform than the smooth CDF's
+        smooth_steps = np.diff(cdf)
+        snapped_steps = np.diff(result)
+        assert np.std(snapped_steps) > np.std(smooth_steps)
+
+        # The max step in snapped should be larger (concentrated at integers)
+        assert np.max(snapped_steps) > np.max(smooth_steps) * 0.8
+
+    def test_pmf_conservation(self):
+        """Total probability mass should be conserved after snapping."""
+        cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=2.0)
+        result = snap_cdf_to_integers(cdf, 0.0, 10.0, open_lower_bound=False, open_upper_bound=False)
+        assert result is not None
+        # Total mass = CDF[-1] - CDF[0]
+        original_mass = cdf[-1] - cdf[0]
+        snapped_mass = result[-1] - result[0]
+        assert abs(snapped_mass - original_mass) < 0.05  # Allow small deviation from redistribution
+
+    def test_strictly_increasing(self):
+        """Every adjacent pair must differ by at least min_step."""
+        cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=2.0)
+        result = snap_cdf_to_integers(cdf, 0.0, 10.0, open_lower_bound=False, open_upper_bound=False)
+        assert result is not None
+        diffs = np.diff(result)
+        assert np.all(diffs >= NUM_MIN_PROB_STEP - 1e-10)
+
+    def test_min_step_compliance(self):
+        """Min step must be >= 5e-5 (Metaculus API requirement)."""
+        cdf = _make_smooth_cdf(0.0, 20.0, center=10.0, spread=3.0)
+        result = snap_cdf_to_integers(cdf, 0.0, 20.0, open_lower_bound=False, open_upper_bound=False)
+        assert result is not None
+        min_diff = float(np.min(np.diff(result)))
+        assert min_diff >= NUM_MIN_PROB_STEP - 1e-10
+
+    def test_max_step_compliance(self):
+        """Max step must be <= 0.2 (Metaculus API requirement)."""
+        cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=2.0)
+        result = snap_cdf_to_integers(cdf, 0.0, 10.0, open_lower_bound=False, open_upper_bound=False)
+        assert result is not None
+        max_diff = float(np.max(np.diff(result)))
+        assert max_diff <= NUM_MAX_STEP + 1e-10
+
+    def test_values_in_unit_interval(self):
+        """All CDF values must be in [0, 1]."""
+        cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=2.0)
+        result = snap_cdf_to_integers(cdf, 0.0, 10.0, open_lower_bound=False, open_upper_bound=False)
+        assert result is not None
+        assert all(0.0 <= v <= 1.0 for v in result)
+
+    def test_wider_range(self):
+        """Snapping works for a wider range like [0, 150] with 151 integers."""
+        cdf = _make_smooth_cdf(0.0, 150.0, center=50.0, spread=20.0)
+        result = snap_cdf_to_integers(cdf, 0.0, 150.0, open_lower_bound=False, open_upper_bound=False)
+        assert result is not None
+        assert len(result) == 201
+        diffs = np.diff(result)
+        assert np.all(diffs >= NUM_MIN_PROB_STEP - 1e-10)
+        assert np.all(diffs <= NUM_MAX_STEP + 1e-10)
+
+
+# =============================================================================
+# Boundary Handling Tests
+# =============================================================================
+
+
+class TestBoundaryHandling:
+    def test_closed_lower_bound(self):
+        """Closed lower bound → CDF[0] == 0.0."""
+        cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=2.0)
+        result = snap_cdf_to_integers(cdf, 0.0, 10.0, open_lower_bound=False, open_upper_bound=False)
+        assert result is not None
+        assert abs(result[0] - 0.0) < 1e-10
+
+    def test_closed_upper_bound(self):
+        """Closed upper bound → CDF[-1] == 1.0."""
+        cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=2.0)
+        result = snap_cdf_to_integers(cdf, 0.0, 10.0, open_lower_bound=False, open_upper_bound=False)
+        assert result is not None
+        assert abs(result[-1] - 1.0) < 1e-10
+
+    def test_open_lower_bound(self):
+        """Open lower bound → CDF[0] >= 0.001."""
+        # Start with open-bound CDF
+        cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=2.0)
+        cdf[0] = 0.005  # Open lower
+        result = snap_cdf_to_integers(cdf, 0.0, 10.0, open_lower_bound=True, open_upper_bound=False)
+        assert result is not None
+        assert result[0] >= 0.001
+
+    def test_open_upper_bound(self):
+        """Open upper bound → CDF[-1] <= 0.999."""
+        cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=2.0)
+        cdf[-1] = 0.995  # Open upper
+        result = snap_cdf_to_integers(cdf, 0.0, 10.0, open_lower_bound=False, open_upper_bound=True)
+        assert result is not None
+        assert result[-1] <= 0.999
+
+
+def create_pchip_distribution_from_cdf(
+    cdf: list[float], question: NumericQuestion, zero_point: float | None = None
+) -> NumericDistribution:
+    """Wrap a pre-built CDF in a PCHIP distribution; the two placeholder percentiles only satisfy ft's minimum."""
+    lb, ub = float(question.lower_bound), float(question.upper_bound)
+    return create_pchip_numeric_distribution(
+        pchip_cdf=cdf,
+        percentile_list=[
+            Percentile(percentile=0.25, value=lb + 0.25 * (ub - lb)),
+            Percentile(percentile=0.75, value=lb + 0.75 * (ub - lb)),
+        ],
+        question=question,
+        zero_point=zero_point,
+    )
+
+
+# =============================================================================
+# Edge Case Tests
+# =============================================================================
+
+
+class TestEdgeCases:
+    def test_high_probability_integer_max_step_redistribution(self):
+        """When one integer has PMF > 0.2, max-step redistribution kicks in."""
+        # Create a CDF with very concentrated mass around integer 5
+        x = np.linspace(0.0, 10.0, 201)
+        cdf = 1.0 / (1.0 + np.exp(-(x - 5.0) / 0.3))  # Very narrow spread
+        cdf[0] = 0.0
+        cdf[-1] = 1.0
+        # Ensure min step
+        for i in range(1, len(cdf)):
+            if cdf[i] - cdf[i - 1] < NUM_MIN_PROB_STEP * 1.1:
+                cdf[i] = cdf[i - 1] + NUM_MIN_PROB_STEP * 1.1
+        cdf = np.clip(cdf, 0.0, 1.0)
+        cdf[-1] = 1.0
+
+        result = snap_cdf_to_integers(cdf.tolist(), 0.0, 10.0, open_lower_bound=False, open_upper_bound=False)
+        assert result is not None
+        max_diff = float(np.max(np.diff(result)))
+        assert max_diff <= NUM_MAX_STEP + 1e-10
+
+    def test_snap_clip_marker_names_the_stage_and_the_question(self, caplog):
+        """The snap-stage CDF_MAXSTEP_CLIP must carry the QUESTION id and its own label.
+
+        The question id is the telemetry archive's join key (markers.py pins the
+        marker to QID_KIND_QUESTION_ID); a snap clip logging question=None silently
+        orphans every clip on a published discrete forecast.
+        """
+        question = _make_question(lower_bound=0.0, upper_bound=10.0)
+        cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=0.3)
+        dist = create_pchip_distribution_from_cdf(cdf, question)
+
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.numeric.pchip_cdf"):
+            result = snap_distribution_to_integers(dist, question)
+
+        assert result is not None
+        markers = [r.getMessage() for r in caplog.records if "CDF_MAXSTEP_CLIP:" in r.getMessage()]
+        assert len(markers) == 1
+        assert f"question={question.id_of_question}" in markers[0]
+        assert "model=ensemble_discrete_snap" in markers[0]
+
+    def test_too_many_integers_returns_none(self):
+        """More than DISCRETE_SNAP_MAX_INTEGERS → skip snapping."""
+        n_ints = DISCRETE_SNAP_MAX_INTEGERS + 50
+        cdf = _make_smooth_cdf(0.0, float(n_ints), center=float(n_ints / 2), spread=float(n_ints / 5))
+        result = snap_cdf_to_integers(cdf, 0.0, float(n_ints), open_lower_bound=False, open_upper_bound=False)
+        assert result is None
+
+    def test_astronomically_wide_range_skips_without_allocating(self):
+        """The integer count is checked arithmetically before any array is built.
+
+        Post 40165 (a revenue question, bounds 2e10 to 8e10) holds 6e10 integers; materialising
+        them as int64 is about 480 GB and killed a replay. The guard has to bail on the count.
+        """
+        lower_bound, upper_bound = 2e10, 8e10
+        cdf = _make_smooth_cdf(lower_bound, upper_bound, center=5e10, spread=1e10)
+        result = snap_cdf_to_integers(cdf, lower_bound, upper_bound, open_lower_bound=False, open_upper_bound=False)
+        assert result is None
+
+    def test_already_discrete_question_skipped(self):
+        """A non-201 grid skips: the snap's step limits are the 201-grid constants."""
+        question = _make_question(lower_bound=-0.5, upper_bound=7.5, cdf_size=9)
+        dist = NumericDistribution(
+            declared_percentiles=[Percentile(value=2.0, percentile=0.25), Percentile(value=5.0, percentile=0.75)],
+            open_upper_bound=False,
+            open_lower_bound=False,
+            upper_bound=7.5,
+            lower_bound=-0.5,
+            zero_point=None,
+            cdf_size=9,
+        )
+        result = snap_distribution_to_integers(dist, question)
+        assert result is None
+
+    def test_log_scaled_small_range(self):
+        """Log-scaled question with small integer range → snapping still works."""
+        # zero_point must sit strictly below lower_bound (ft 0.2.92 validates this)
+        question = _make_question(lower_bound=0.0, upper_bound=20.0, zero_point=-1.0)
+        cdf = _make_smooth_cdf(0.0, 20.0, center=10.0, spread=3.0)
+
+        dist = create_pchip_numeric_distribution(
+            pchip_cdf=cdf,
+            percentile_list=[Percentile(value=5.0, percentile=0.25), Percentile(value=15.0, percentile=0.75)],
+            question=question,
+            zero_point=-1.0,
+        )
+        result = snap_distribution_to_integers(dist, question)
+        # 21 integers in [0, 20], should snap
+        assert result is not None
+
+    def test_log_scaled_huge_range_skipped(self):
+        """Log-scaled question with huge integer range → skip."""
+        question = _make_question(lower_bound=0.0, upper_bound=10000.0, zero_point=-1.0)
+        cdf = _make_smooth_cdf(0.0, 10000.0, center=5000.0, spread=1000.0)
+        dist = create_pchip_distribution_from_cdf(cdf, question, zero_point=-1.0)
+        result = snap_distribution_to_integers(dist, question)
+        assert result is None
+
+    def test_single_integer_in_range(self):
+        """Edge case: only one integer in range."""
+        cdf = _make_smooth_cdf(0.5, 1.5, center=1.0, spread=0.2)
+        result = snap_cdf_to_integers(cdf, 0.5, 1.5, open_lower_bound=False, open_upper_bound=False)
+        assert result is not None
+        assert len(result) == 201
+        diffs = np.diff(result)
+        assert np.all(diffs >= NUM_MIN_PROB_STEP - 1e-10)
+
+    def test_no_integers_in_range(self):
+        """Edge case: no integers in range (e.g., [0.1, 0.9])."""
+        cdf = _make_smooth_cdf(0.1, 0.9, center=0.5, spread=0.1)
+        result = snap_cdf_to_integers(cdf, 0.1, 0.9, open_lower_bound=False, open_upper_bound=False)
+        assert result is None
+
+
+# =============================================================================
+# Vote Parsing Tests
+# =============================================================================
+
+
+class TestOutcomeTypeResult:
+    def test_model_discrete(self):
+        result = OutcomeTypeResult(is_discrete_integer=True)
+        assert result.is_discrete_integer is True
+
+    def test_model_continuous(self):
+        result = OutcomeTypeResult(is_discrete_integer=False)
+        assert result.is_discrete_integer is False
+
+    def test_model_from_dict(self):
+        result = OutcomeTypeResult.model_validate({"is_discrete_integer": True})
+        assert result.is_discrete_integer is True
+
+
+class TestMajorityVote:
+    def test_majority_discrete(self):
+        assert majority_votes_discrete([True, True, False]) is True
+
+    def test_majority_continuous(self):
+        assert majority_votes_discrete([False, False, True]) is False
+
+    def test_tie_is_not_majority(self):
+        assert majority_votes_discrete([True, False]) is False
+
+    def test_unanimous_discrete(self):
+        assert majority_votes_discrete([True, True, True]) is True
+
+    def test_empty_votes(self):
+        assert majority_votes_discrete([]) is False
+
+    def test_single_vote_discrete(self):
+        assert majority_votes_discrete([True]) is True
+
+    def test_single_vote_continuous(self):
+        assert majority_votes_discrete([False]) is False
+
+
+# =============================================================================
+# Round-Trip Validation Tests
+# =============================================================================
+
+
+class TestRoundTripValidation:
+    """Verify snapped CDFs pass all Metaculus constraint checks."""
+
+    def _assert_metaculus_constraints(self, cdf: list[float], open_lower: bool, open_upper: bool):
+        """Check all server-side constraints from Metaculus backend."""
+        assert len(cdf) == 201
+        assert all(0.0 <= v <= 1.0 for v in cdf)
+
+        diffs = np.diff(cdf)
+        min_diff = float(np.min(diffs))
+        max_diff = float(np.max(diffs))
+
+        # Min step: 0.01 / 200 = 5e-5
+        assert min_diff >= 5e-5 - 1e-10, f"min_diff={min_diff} < 5e-5"
+        # Max step: 0.2
+        assert max_diff <= 0.2 + 1e-10, f"max_diff={max_diff} > 0.2"
+        # Boundary constraints
+        if not open_lower:
+            assert abs(cdf[0]) < 1e-10, f"closed lower bound: cdf[0]={cdf[0]}"
+        else:
+            assert cdf[0] >= 0.001, f"open lower bound: cdf[0]={cdf[0]} < 0.001"
+        if not open_upper:
+            assert abs(cdf[-1] - 1.0) < 1e-10, f"closed upper bound: cdf[-1]={cdf[-1]}"
+        else:
+            assert cdf[-1] <= 0.999, f"open upper bound: cdf[-1]={cdf[-1]} > 0.999"
+
+    def test_roundtrip_closed_bounds(self):
+        cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=2.0)
+        result = snap_cdf_to_integers(cdf, 0.0, 10.0, open_lower_bound=False, open_upper_bound=False)
+        assert result is not None
+        self._assert_metaculus_constraints(result, False, False)
+
+    def test_roundtrip_open_bounds(self):
+        cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=2.0)
+        cdf[0] = 0.005
+        cdf[-1] = 0.995
+        result = snap_cdf_to_integers(cdf, 0.0, 10.0, open_lower_bound=True, open_upper_bound=True)
+        assert result is not None
+        self._assert_metaculus_constraints(result, True, True)
+
+    def test_roundtrip_concentrated_distribution(self):
+        """Concentrated distribution (narrow spread) still passes all constraints."""
+        x = np.linspace(0.0, 10.0, 201)
+        cdf = 1.0 / (1.0 + np.exp(-(x - 5.0) / 0.5))
+        cdf[0] = 0.0
+        cdf[-1] = 1.0
+        for i in range(1, len(cdf)):
+            if cdf[i] - cdf[i - 1] < NUM_MIN_PROB_STEP * 1.1:
+                cdf[i] = cdf[i - 1] + NUM_MIN_PROB_STEP * 1.1
+        cdf = np.clip(cdf, 0.0, 1.0)
+        cdf[-1] = 1.0
+
+        result = snap_cdf_to_integers(cdf.tolist(), 0.0, 10.0, open_lower_bound=False, open_upper_bound=False)
+        assert result is not None
+        self._assert_metaculus_constraints(result, False, False)
+
+    def test_roundtrip_wide_range(self):
+        """Range [0, 150] with 151 integers passes constraints."""
+        cdf = _make_smooth_cdf(0.0, 150.0, center=75.0, spread=25.0)
+        result = snap_cdf_to_integers(cdf, 0.0, 150.0, open_lower_bound=False, open_upper_bound=False)
+        assert result is not None
+        self._assert_metaculus_constraints(result, False, False)
+
+    def test_roundtrip_framework_validation(self):
+        """Snapped CDF passes the framework's _validate_pchip_cdf()."""
+
+        question = _make_question(lower_bound=0.0, upper_bound=10.0)
+        cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=2.0)
+        result = snap_cdf_to_integers(cdf, 0.0, 10.0, open_lower_bound=False, open_upper_bound=False)
+        assert result is not None
+        _validate_pchip_cdf(result, question)
+
+
+# =============================================================================
+# Scoring Tests — Metaculus log score impact of snapping
+# =============================================================================
+
+
+def _log_score(cdf: list[float], resolution: float, lb: float, ub: float) -> float:
+    """Shorthand for numeric_log_score with closed bounds."""
+    return numeric_log_score(cdf, resolution, lb, ub, open_lower_bound=False, open_upper_bound=False)
+
+
+class TestDiscreteSnapScoring:
+    """Metaculus log score impact of discrete snapping.
+
+    With steps placed at integer positions k, the snapped CDF concentrates
+    mass in exactly the scored PMF bucket for integer resolutions. This means
+    snapping improves log scores for integer resolutions (the common case for
+    discrete-integer questions). Non-integer resolutions still score worse
+    since mass is concentrated at integers, not between them.
+    """
+
+    @pytest.mark.parametrize("resolution", range(1, 10))
+    def test_snapped_beats_smooth_for_integer_resolution(self, resolution: int):
+        """Snapping improves log score for integer resolutions (step alignment at k)."""
+        cdf_smooth = _make_smooth_cdf(0.0, 10.0, center=float(resolution), spread=2.0)
+        cdf_snapped = snap_cdf_to_integers(cdf_smooth, 0.0, 10.0, open_lower_bound=False, open_upper_bound=False)
+        assert cdf_snapped is not None
+        score_smooth = _log_score(cdf_smooth, float(resolution), 0.0, 10.0)
+        score_snapped = _log_score(cdf_snapped, float(resolution), 0.0, 10.0)
+        assert np.isfinite(score_snapped)
+        assert score_snapped > score_smooth
+
+    def test_snapped_scores_finite_for_noninteger(self):
+        """For non-integer resolution, snapping produces a finite (but worse) score."""
+        resolution = 5.3
+        cdf_smooth = _make_smooth_cdf(0.0, 10.0, center=resolution, spread=2.0)
+        cdf_snapped = snap_cdf_to_integers(cdf_smooth, 0.0, 10.0, open_lower_bound=False, open_upper_bound=False)
+        assert cdf_snapped is not None
+        score_smooth = _log_score(cdf_smooth, resolution, 0.0, 10.0)
+        score_snapped = _log_score(cdf_snapped, resolution, 0.0, 10.0)
+        assert np.isfinite(score_snapped)
+        assert score_snapped < score_smooth
+
+    def test_concentrated_distribution_snapped_is_finite(self):
+        """Narrow spread with max-step redistribution still produces finite scores."""
+        cdf_smooth = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=0.5)
+        cdf_snapped = snap_cdf_to_integers(cdf_smooth, 0.0, 10.0, open_lower_bound=False, open_upper_bound=False)
+        assert cdf_snapped is not None
+        score_snapped = _log_score(cdf_snapped, 5.0, 0.0, 10.0)
+        assert np.isfinite(score_snapped)
+
+    def test_lower_bound_integer_closed_bound(self):
+        """Resolution at lower bound (0 on [0,10], closed) improves with snapping."""
+        cdf_smooth = _make_smooth_cdf(0.0, 10.0, center=0.0, spread=2.0)
+        cdf_snapped = snap_cdf_to_integers(cdf_smooth, 0.0, 10.0, open_lower_bound=False, open_upper_bound=False)
+        assert cdf_snapped is not None
+        assert abs(cdf_snapped[0] - 0.0) < 1e-10
+        score_snapped = _log_score(cdf_snapped, 0.0, 0.0, 10.0)
+        assert np.isfinite(score_snapped)
+
+
+# =============================================================================
+# Distribution-Level Tests
+# =============================================================================
+
+
+class TestSnapDistributionToIntegers:
+    def test_returns_distribution(self):
+        question = _make_question(lower_bound=0.0, upper_bound=10.0)
+        cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=2.0)
+        dist = create_pchip_distribution_from_cdf(cdf, question)
+        result = snap_distribution_to_integers(dist, question)
+        assert result is not None
+        assert isinstance(result, NumericDistribution)
+        assert len(result.cdf) == 201
+
+    def test_skips_discrete_question(self):
+        question = _make_question(lower_bound=-0.5, upper_bound=7.5, cdf_size=9)
+        dist = NumericDistribution(
+            declared_percentiles=[Percentile(value=2.0, percentile=0.25), Percentile(value=5.0, percentile=0.75)],
+            open_upper_bound=False,
+            open_lower_bound=False,
+            upper_bound=7.5,
+            lower_bound=-0.5,
+            zero_point=None,
+            cdf_size=9,
+        )
+        assert snap_distribution_to_integers(dist, question) is None
+
+
+# =============================================================================
+# Integration Test: _maybe_snap_to_integers
+# =============================================================================
+
+
+class TestMaybeSnapIntegration:
+    """Test the vote-collection → majority-check → snap-application flow
+    through AggregationPipeline._maybe_snap_to_integers."""
+
+    def _make_bot(self):
+        llms_config = {
+            "default": GeneralLlm(model="test_default"),
+            "summarizer": "mock_summarizer_model",
+            "parser": "mock_parser_model",
+            "researcher": "mock_researcher_model",
+        }
+        return TemplateForecaster(llms=llms_config)
+
+    def test_majority_discrete_snaps_distribution(self):
+        """When majority of votes are DISCRETE, snapping is applied and the returned distribution differs."""
+        bot = self._make_bot()
+        question = _make_question(lower_bound=0.0, upper_bound=10.0)
+        cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=2.0)
+        distribution = create_pchip_distribution_from_cdf(cdf, question)
+
+        qid = question.id_of_question
+        assert qid is not None
+        bot._pipeline.discrete_integer_votes[qid] = [True, True, False]
+
+        result = bot._pipeline._maybe_snap_to_integers(distribution, question)
+
+        assert result is not distribution
+        assert isinstance(result, NumericDistribution)
+        assert len(result.cdf) == 201
+
+    def test_majority_continuous_returns_original(self):
+        """When majority of votes are CONTINUOUS, the original distribution object is returned unchanged."""
+        bot = self._make_bot()
+        question = _make_question(lower_bound=0.0, upper_bound=10.0)
+        cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=2.0)
+        distribution = create_pchip_distribution_from_cdf(cdf, question)
+
+        qid = question.id_of_question
+        assert qid is not None
+        bot._pipeline.discrete_integer_votes[qid] = [False, False, True]
+
+        result = bot._pipeline._maybe_snap_to_integers(distribution, question)
+
+        assert result is distribution
+
+    def test_no_votes_returns_original(self):
+        """When no votes exist for the question, the original distribution is returned."""
+        bot = self._make_bot()
+        question = _make_question(lower_bound=0.0, upper_bound=10.0)
+        cdf = _make_smooth_cdf(0.0, 10.0, center=5.0, spread=2.0)
+        distribution = create_pchip_distribution_from_cdf(cdf, question)
+
+        result = bot._pipeline._maybe_snap_to_integers(distribution, question)
+
+        assert result is distribution
+
+
+class TestSnapCdfGoldenOutputs:
+    """Exact-output pins on a small grid.
+
+    The snapper chains half-integer PMF extraction, a ``searchsorted`` step-CDF
+    reconstruction, the closed-lower pin, the uniform mixture, and
+    ``safe_cdf_bounds``. The property tests above cover each constraint the output must
+    satisfy; these goldens pin the composition, so the stages can be split into helpers
+    without silently changing a submitted CDF. Captured from the implementation as of
+    2026-08-26.
+    """
+
+    GOLDEN: ClassVar[dict[str, list[float]]] = {
+        "linear21_closed": [
+            0.0,
+            0.05,
+            0.14994225,
+            0.15,
+            0.24994225,
+            0.25,
+            0.34994225,
+            0.35,
+            0.44994225,
+            0.45,
+            0.54994225,
+            0.55,
+            0.64994225,
+            0.65,
+            0.74994225,
+            0.75,
+            0.84994225,
+            0.85,
+            0.94994225,
+            0.95,
+            1.0,
+        ],
+        "linear21_open": [
+            0.04994225,
+            0.05,
+            0.14994225,
+            0.15,
+            0.24994225,
+            0.25,
+            0.34994225,
+            0.35,
+            0.44994225,
+            0.45,
+            0.54994225,
+            0.55,
+            0.64994225,
+            0.65,
+            0.74994225,
+            0.75,
+            0.84994225,
+            0.85,
+            0.94994225,
+            0.95,
+            0.999,
+        ],
+        # Recaptured 2026-08-31 for the nearest-first max-step repair; docs/numeric_pipeline.md Step 5
+        "conc21_closed": [
+            0.0,
+            5.775e-05,
+            0.0001155,
+            0.00017325,
+            0.000231,
+            0.00028875,
+            0.0003465,
+            0.02528875,
+            0.22528875,
+            0.3900345699585,
+            0.5900345699585,
+            0.758111680732088,
+            0.958111680732088,
+            0.99959575,
+            0.9996535,
+            0.99971125,
+            0.999769,
+            0.99982675,
+            0.9998845,
+            0.99994225,
+            1.0,
+        ],
+    }
+
+    @staticmethod
+    def _input_cdf(name: str) -> list[float]:
+        if name == "conc21_closed":
+            return list(np.clip((np.linspace(0.0, 10.0, 21) - 4.0) / 2.0, 0.0, 1.0))
+        return list(np.linspace(0.0, 1.0, 21))
+
+    @pytest.mark.parametrize("name", list(GOLDEN))
+    def test_golden_output(self, name: str):
+        open_bounds = name.endswith("_open")
+
+        result = snap_cdf_to_integers(
+            self._input_cdf(name),
+            0.0,
+            10.0,
+            open_lower_bound=open_bounds,
+            open_upper_bound=open_bounds,
+        )
+
+        assert result is not None
+        np.testing.assert_allclose(result, self.GOLDEN[name], rtol=0, atol=1e-12)
+
+
+# =============================================================================
+# Natively discrete questions are never snapped, whatever their grid
+# =============================================================================
+
+
+class TestNativelyDiscreteQuestionsAreNeverSnapped:
+    """The skip is keyed on the question TYPE, not on ``cdf_size == 201``.
+
+    A natively discrete question's bins are its outcome space: a 0.1-step grid resolves in
+    tenths, so an integer vote is simply wrong there, and on a 1.0-step integer-centred grid
+    the snap is a no-op. ``cdf_size`` cannot carry that: a 200-bin Mantic discrete question
+    has ``cdf_size == 201`` (thirteen in the Series 1 corpus, with steps 1.0, 1.005 and
+    251.25), so the old ``cdf_size != 201`` guard let them through and only the 200-integer
+    cap kept the snap off them (Mantic edge-case review, 2026-09, rank 14). Every Mantic
+    quantitative question and every Metaculus discrete question parses as
+    ``DiscreteQuestion``; Metaculus continuous count questions stay ``NumericQuestion`` and
+    keep the snap they were built for.
+    """
+
+    @staticmethod
+    def _discrete_question(lower_bound: float, upper_bound: float, cdf_size: int) -> DiscreteQuestion:
+        return DiscreteQuestion(
+            id_of_question=999,
+            id_of_post=999,
+            page_url="https://competitions.mantic.com/questions/999",
+            question_text="Discrete corpus question",
+            background_info="",
+            resolution_criteria="",
+            fine_print="",
+            published_time=None,
+            close_time=None,
+            lower_bound=lower_bound,
+            upper_bound=upper_bound,
+            open_lower_bound=False,
+            open_upper_bound=False,
+            unit_of_measure="",
+            zero_point=None,
+            cdf_size=cdf_size,
+        )
+
+    @staticmethod
+    def _smooth_distribution(question: NumericQuestion) -> NumericDistribution:
+        x = np.linspace(question.lower_bound, question.upper_bound, question.cdf_size)
+        centre, spread = (
+            (question.lower_bound + question.upper_bound) / 2,
+            (question.upper_bound - question.lower_bound) / 8,
+        )
+        cdf = 1.0 / (1.0 + np.exp(-(x - centre) / spread))
+        cdf[0], cdf[-1] = 0.0, 1.0
+        return create_pchip_numeric_distribution(
+            pchip_cdf=cdf.tolist(),
+            percentile_list=[
+                Percentile(value=question.lower_bound + 1, percentile=0.25),
+                Percentile(value=question.upper_bound - 1, percentile=0.75),
+            ],
+            question=question,
+            zero_point=None,
+        )
+
+    @pytest.mark.parametrize(
+        ("lower_bound", "upper_bound", "cdf_size"),
+        [
+            pytest.param(-0.5, 199.5, 201, id="step-1.0-integer-centred-200-bins"),
+            pytest.param(-0.5, 200.5, 201, id="step-1.005-corpus-shape"),
+            pytest.param(-0.05, 20.05, 202, id="step-0.1-series-2-shape"),
+            pytest.param(0.0, 20.0, 201, id="step-0.1-hunter-scenario"),
+        ],
+    )
+    def test_discrete_question_is_skipped_on_every_grid(
+        self, lower_bound: float, upper_bound: float, cdf_size: int, caplog
+    ) -> None:
+        question = self._discrete_question(lower_bound, upper_bound, cdf_size)
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.numeric.discrete_snap"):
+            result = snap_distribution_to_integers(self._smooth_distribution(question), question)
+
+        assert result is None
+        skip_lines = [r.getMessage() for r in caplog.records if "Discrete snap skipped" in r.getMessage()]
+        assert len(skip_lines) == 1
+        assert "already its outcome space" in skip_lines[0]
+        assert "type=DiscreteQuestion" in skip_lines[0]
+        assert f"cdf_size={cdf_size}" in skip_lines[0]
+
+    def test_continuous_fractional_step_grid_still_snaps(self) -> None:
+        """The designed target: a Metaculus continuous count question, [0, 10] at 201 points (step 0.05)."""
+        question = _make_question(lower_bound=0.0, upper_bound=10.0)
+        result = snap_distribution_to_integers(self._smooth_distribution(question), question)
+        assert result is not None
+        assert len(result.get_cdf()) == 201
+
+    def test_non_201_grid_is_skipped_with_the_same_reason(self, caplog) -> None:
+        question = _make_question(lower_bound=-0.5, upper_bound=7.5, cdf_size=9)
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.numeric.discrete_snap"):
+            result = snap_distribution_to_integers(self._smooth_distribution(question), question)
+        assert result is None
+        assert any("grid_step=1" in r.getMessage() for r in caplog.records)

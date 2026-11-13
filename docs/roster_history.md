@@ -1,0 +1,133 @@
+# Ensemble roster, its history, and the dormant subsystems
+
+`metaculus_bot/llm_configs.py` is the authoritative roster and rotates often, so read it
+rather than this doc for who is in the ensemble today. What this doc holds is the part the
+code cannot tell you: the standing design rule for choosing the roster, the dated history
+of every roster change and which merge made it live, the support-model roles and why each
+sits where it does, and the status of the two subsystems that are fully wired but
+deliberately dormant in production (`probabilistic_tools` and `tool_runner`).
+
+Read it when you are about to change the roster, when you are bucketing resolved
+questions into config eras, or when you are tempted to revive a dormant path. Era
+boundaries are merge-to-main timestamps, never authoring dates; the rule and its receipts
+live in [performance_analysis.md](performance_analysis.md).
+
+Last verified against the code on 2026-09-04.
+
+## The roster and the standing design rule
+
+`FORECASTER_LLMS` in `metaculus_bot/llm_configs.py` is the authoritative roster. It rotates frequently, so read it rather than trusting any copy. This file deliberately does not name the current members outside the dated history below. The standing design is latest-per-vendor: the newest frontier reasoning model from each major vendor, one slot each. **"Latest" can only be resolved from a LIVE model-list read, never from memory or from this file**: nothing in the repo can say what it currently resolves to, and the 2026-08-31 gemini-slot review found a roster decision needs that one read before anything else. The read is a free OpenRouter metadata pull and the checks that go with it (reasoning tier, donated-key provider list, effort-enum ceiling) are in docs/operations.md "Season-start checklist"; `llm_configs.py` carries a pointer comment above `FORECASTER_LLMS`. It is an operator step, not an implementing session's: a roster change is also a config-era boundary, so it goes in one merge before the season's first question. Do NOT hardcode model names outside `llm_configs.py` and the support-model constants in `constants.py` (see "Support models" below for which roles sit where and why); `tests/test_model_name_locations.py` pins every file allowed to hold a model-id literal, so a new location reddens CI. Provider: OpenRouter with automatic key fallback. Dropping grok (x-ai) ended routine personal-key forecaster spend: the only forecaster still billing `OPENROUTER_API_KEY` is the Google slot pinned by the `DONATED_KEY_BLOCKED_GOOGLE_MODELS` blocklist (`fallback_openrouter.py`); the rest route via the donated key. Alongside the roster shrink, `MIN_FORECASTERS_TO_PUBLISH` (constants.py) was lowered 3→2→1 over 2026-07-20; the operator accepts publishing on a single surviving forecaster (median-of-1 = that forecast), with `route_after_forecasts` (`stacking_route.py`) short-circuiting the n==1 case before spread computation + stacking (the `spread_metrics` helpers require ≥2 predictions and raise otherwise). Exception-driven drops stay CI-visible via the alertable counter, so a degraded single-forecaster publish still reddens CI rather than silently withholding the question.
+
+## Roster-change history
+
+**2026-10-13 (research evidence and comment publication; merged with PR #77, 28e82b6, 2026-10-14T15:14:09Z):** The live agentic
+research proposal contract changes from model-transcribed quotations to delivered evidence
+references. Corrections remain prominent driver interpretations, with source excerpts,
+structured API data, provider summaries, generated answers and calculations identified separately; fetched text
+no longer unconditionally supersedes the briefing. Document selection distinguishes an empty
+answer from an extractor failure, and public comments use one complete-comment budget before
+the framework's length guard. This is a pipeline behavior boundary, with no roster,
+aggregation, transport or deadline change. It is recorded in `performance_analysis/eras.py` as
+part of the `fall_gemini4_argon` sub-era, pooled into `triple_fall_config`.
+
+**2026-10-14 (Gemini 4 Argon, PR #77, 28e82b6, 2026-10-14T15:14:09Z):** The Google forecaster slot
+moved from `gemini-3.1-pro-preview` to `gemini-4-argon` in the same merge as the evidence change
+above, so the two share one era boundary (`fall_gemini4_argon` in `eras.py`). The fall analysis pools
+every fall sub-era (operator ruling 2026-11-04).
+
+**All dates below are AUTHORING dates on the july15 branch; every one of them reached prod together in merge `b4e9df0` at 2026-07-21T17:07:37Z, which is the single era boundary** (see the merge-date rule under era-bucketing): 2026-07-15: Fable-5 joined the forecaster roster (was stacker-only; stacking disabled in prod made it idle) and opus-4.6 retired, keeping n=6 at a 2 Anthropic / 2 OpenAI / 1 Google / 1 xAI balance. 2026-07-20 (first change): Fable-5 PULLED from the forecaster roster and the stacker after it returned `message.content=None` on 4/4 attempts for Q14333's numeric forecast + a truncated no-JSON-block output on Q578 in the 2026-07-19 test_bot run (suspected content classifiers refusing certain question content: fast deterministic empty completions, not timeouts); opus-4.7 took the slot, keeping n=6. Reconsidering fable-5 is a tracked follow-up (FUTURE.md). 2026-07-20 (second change, current): dropped from 6 to the 3-member latest-per-vendor triple, removing gpt-5.5, opus-4.7, and grok-4.5. Two adversarially-verified analyses (`scratch/ensemble_3member_audit_2026-07-20/` + `scratch/ensemble_power_model_2026-07-20/`) found the triple non-inferior on binary/MC and only a fragile numeric lean toward the full roster (+3.24, 95% CI [-2.5, +9.1], P(loss>1pt/Q)=0.80, driven by 2 questions); accepted as a ship-and-watch bet (see FUTURE.md "Triple-era September re-read"). This second change supersedes the first as the roster in effect, but both landed in the same merge, so residual analysis sees ONE boundary at 2026-07-21T17:07:37Z. No prod run ever used the intermediate opus-4.7 roster.
+
+**2026-10-27 (GPT-6.1 Terra for the expensive research roles):** At the operator's request, three roles that
+sat on Sol only because GPT-6 shipped without a Terra tier move to `gpt-6.1-terra`: the gap resolver, the agentic
+gap-fill driver and the AskNews summarizer. Together they cost about $0.70 of a $1.51 question on Sol, and the live
+[OpenRouter model catalog](https://openrouter.ai/api/v1/models) lists `openai/gpt-6.1-terra` at $1/$5 per million
+tokens against Sol's $2/$10. A resolver probe on question 46032 and a two-question research-only run found Terra's
+resolver and driver output as complete as Sol's at roughly half the cost. Native search and the gap analyzer stay
+on `gpt-6.1-sol`: Terra's output there was thinner on the same trial, and the two roles cost about $0.16 per
+question between them. The disagreement analyzer, the forecasters, the stacker fallback and the ablation lineup
+also stay on Sol. Efforts, timeouts, token caps and key routing are unchanged. This is a research-pipeline boundary
+with no forecaster roster change.
+
+**2026-09-29 (GPT-6.1 Sol migration):** At the operator's request, every active `gpt-6-sol`
+default moves to `gpt-6.1-sol`: the OpenAI forecaster, AskNews summarizer,
+stacker fallback, disagreement analyzer, native search, gap analyzer, gap resolver, agentic gap-fill driver,
+and corresponding ablation defaults. The free live [OpenRouter model catalog](https://openrouter.ai/api/v1/models)
+confirmed `openai/gpt-6.1-sol`; [OpenAI's model documentation](https://developers.openai.com/api/docs/models/gpt-6.1-sol)
+confirms the model and the low, medium and xhigh efforts already used here. Reasoning efforts,
+timeouts, token caps and key routing stay unchanged; standard input/output prices remain $2/$10
+per million tokens, while cached input falls from $0.20 to $0.10. This session verifies metadata
+and offline behavior only; it does not run paid inference or establish latency or forecast quality
+for the new model, and the production era starts at the eventual merge-to-main committer timestamp.
+
+**2026-09-22 (GPT-6 / opus-5.5 migration):** OpenAI released GPT-6 (`openai/gpt-6-luna`, `openai/gpt-6-sol`,
+verified on a live OpenRouter model-list read the same day) and Anthropic released `anthropic/claude-opus-5.5`.
+Forecaster roster: `gpt-5.6-sol` -> `gpt-6-sol` with effort `high` -> `xhigh` (operator; checked against
+`FORECASTER_SOFT_DEADLINE` by a single prod-prompt timing probe), `claude-opus-4.8` -> `claude-opus-5.5` at declared effort `xhigh`, with `extra_body={"verbosity": "high"}`
+REMOVED from both Anthropic slots (forecaster and stacker). On Anthropic models OpenRouter maps both `verbosity` and
+`reasoning.effort` onto the single `output_config.effort`, and "`verbosity` wins if both are passed" (OpenRouter's
+Claude 4.7 migration guide). `verbosity: "high"` had been on the Anthropic slots since at least 2026-02, so the
+2026-07-15 "xhigh" bump on the Anthropic forecaster and stacker most likely never took effect: **for era and effort
+analysis, read every Anthropic slot before this merge as running at effort `high`**, and this merge as its first
+real `xhigh`. A test now forbids sending `verbosity` beside `reasoning` on any forecaster or stacker. The
+Terra tier got no GPT-6 successor, so every Terra-tier support role (summarizer, disagreement analyzer, native
+search, gap-fill analyzer, gap-fill resolver, gap-fill v2 driver) moved to Sol 6 at the same effort it ran at
+(`low`). Every Luna-tier support role (parser, market ranker, market query author, page-digest extractor,
+financial classifier, leakage detector) moved to `gpt-6-luna` at the same effort. The backtest-only leakage
+detector additionally moved from effort `low` with a `max_tokens=500` cap to effort `high` (first `max`, lowered the same day by the operator) with the cap removed
+entirely (operator: this screen is not time-sensitive, and a `max_tokens` cap crashes calls for no good reason
+since the reasoning tokens count against it). The same reasoning dropped the small caps on the financial classifier
+(500) and both prediction-market stages (3,000 / 1,500); their timeouts bound a runaway. The 32k/64k caps in
+`UTILITY_MODEL_CONFIG` / `REASONING_MODEL_CONFIG` stay: they sit far above any measured completion. Ablation prod-mirror entries (`ablation/forecaster_lineup.py`,
+`ablation/run_stacker.py`) followed the same swaps; `opus-4.6` in the free-tier-vs-prod ablation comparison was
+left untouched. GPT-6's effort enum is documented by OpenAI as `none/low/medium/high/xhigh/max`
+(developers.openai.com/api/docs/models/gpt-6-luna), and a live probe on 2026-09-22 confirmed OpenRouter's OpenAI
+route now accepts `max` on gpt-6-luna and gpt-6-sol (reasoning tokens rose with each tier; a bogus value 400s). The
+same day's probes timed one prod numeric forecaster prompt at xhigh (gpt-6-sol 72.5 s, opus-5.5 25.5 s, both well
+inside `FORECASTER_SOFT_DEADLINE`; that opus figure was taken with `verbosity: "high"` still sent, i.e. at effective
+`high`. Rerun without it at true `xhigh`: 48.7 s and 2,770 reasoning tokens against 798 before, the direct evidence that
+verbosity had been overriding the declared effort).
+gpt-6-luna at `max` against gpt-6-sol at `low` on one question: with prod's 16k / 32k caps luna spent the whole
+budget on reasoning and returned nothing, and uncapped it finished native search in 278 s (sol 30 s) and the AskNews
+summarizer in 438 s (sol 15 s, over the summarizer's 300 s wall). A blind Opus judge preferred luna's native-search
+brief (medium confidence) and sol's summary (concision), neither difference material, so both roles stay on sol.
+Receipts: `scratch/model_migration_2026-09-22/`.
+
+## Support models
+
+A support model sits in one of two places, and the boundary is who builds the client. `llm_configs.py` holds the module-level `GeneralLlm` objects and config dicts, meaning every role the forecaster pipeline constructs once at import time; those are the four bullets below. `constants.py` holds a bare model-id string for each support role whose consuming module builds its own client at call time, kept beside that role's env-var name, timeout and price note; those are the list after them. The strings cannot be moved into `llm_configs.py`. `constants.py` is a foundation leaf under the pyproject import-linter contract, importing `llm_configs.py` from it is a genuine circular import through `fallback_openrouter.py`, and `llm_configs.py` reads no environment variables, which several of these roles need. `tests/test_model_name_locations.py` pins the full set of files allowed to hold a model-id literal, so neither list can quietly grow a third home.
+
+### LLM objects in `llm_configs.py`
+
+- **Stacker**: `STACKER_LLM`, the Anthropic slot since 2026-07-20, uses effort-based adaptive thinking; the stacker chain remains configured but disabled in production. It falls back to `STACKER_FALLBACK_LLM`, deliberately a different vendor so an Anthropic stall does not take both attempts down. Both run at xhigh with `allowed_tries=1`, while the fallback has a tighter timeout because it fires late on the critical path. The OpenAI and Anthropic forecasters also run at xhigh; the Google forecaster runs at provider defaults. GPT-6.1 Sol supports low, medium, high, xhigh and max, with none and minimal unsupported; the configured effort stays at xhigh, preserving the operator's 2026-09-22 choice. The dated effort changes and timing receipts are recorded above, and the high-versus-xhigh quality/cost comparison remains open in FUTURE.md.
+- **Disagreement analyzer**: `DISAGREEMENT_ANALYZER_LLM` (low-effort crux extractor; quality drives targeted-search query, running under `CRUX_SOFT_DEADLINE`; sol→terra 2026-07-17 per the blind role audit: terra 2nd, sol 3rd, at −49% cost, and the role fires rarely with stacking disabled in prod).
+- **Summarizer / researcher**: `SUMMARIZER_LLM` (aliased as `RESEARCHER_LLM`; low effort, deterministic; sol→terra 2026-07-18 operator decision: AskNews is an auxiliary source per the content audit (16% unique content), the role audit had sol over terra only at "MARGINAL EDGE", and 4/5 audited briefing failures were prompt-era not model-tier; terra −43% cost, ~50s vs ~118s wall). The summarizer prompt carries the 2026-07-18 AskNews-audit rules: a hard per-article relevance gate (off-topic articles DROPPED to a one-line "Screened out as not decision-relevant" list), recency-first ordering (lead with the newest resolution-relevant facts, don't mirror the raw Historical/Recent input structure), supersession + quote-the-deadline-inputs arithmetic transparency, an evidence-age disclosure opening the briefing ("Newest directly-relevant article: ..."), and a proportionality rule (length tracks decision-relevant content, not article count).
+- **Parser**: `PARSER_LLM` (low effort, deterministic; a capability-saturated extraction task, so it sits on the cheapest tier that saturates it. The per-token comparison behind that choice is in the `llm_configs.py` comment).
+
+### Model-id strings in `constants.py`
+
+- **Gemini native SDK**: `GEMINI_SEARCH_DEFAULT_MODEL` (the grounded-search provider) and `GAP_FILL_V2_READER_MODEL` (the paid `url_context` reader on the resolution-source fetcher's last rung). Both call google-genai directly and never build a `GeneralLlm` at all. They deliberately carry the SAME id, so one live verification covers both surfaces and one model draws the 5,000-prompt monthly grounded allowance the whole AI Studio key shares; `tests/test_constants.py::TestGeminiNativeSdkModelDefaults` fails if they diverge. Rotating them is therefore a two-line edit in `constants.py` plus the one expected value in that test, checked with `uv run python scripts/probes/gemini_verify.py --i-accept-spend` (paid, cents, operator-gated; see [operations.md](operations.md)). A per-run override goes through the `GEMINI_SEARCH_MODEL` env var named by `GEMINI_SEARCH_MODEL_ENV`.
+- **Native OpenAI search**: `NATIVE_SEARCH_DEFAULT_MODEL`, overridable per run through the `NATIVE_SEARCH_MODEL` env var named by `NATIVE_SEARCH_MODEL_ENV`.
+- **Perplexity research**: `PERPLEXITY_RESEARCH_MODEL`, with `PERPLEXITY_RESEARCH_MODEL_VIA_OPENROUTER` derived from it by prefix so the one id can be called direct or through OpenRouter.
+- **Gap-fill roles**: `GAP_FILL_ANALYZER_MODEL` and `GAP_FILL_RESOLVER_MODEL` for v1 (`research/targeted.py`), and `GAP_FILL_V2_DRIVER_MODEL` for the agentic loop driver (`os.getenv`-overridable, like the v2 reader).
+- **Classifiers**: `FINANCIAL_CLASSIFIER_MODEL` (does this question need financial data?) and `LEAKAGE_DETECTOR_MODEL` (the backtest-only leakage screen). The leakage detector is a benchmarking guard, so treat a change to it as load-bearing rather than a tier tweak.
+- **Page digest extractor**: `PAGE_DIGEST_EXTRACTOR_MODEL` at `PAGE_DIGEST_EXTRACTOR_EFFORT` (`research/page_digest.py`), the LLM-extractive digest of a long fetched page with a literal grounding check and a BM25 fallback, billing the `page_digest_extractor` role. The operator's choice of 2026-09-09 is luna at medium ("dirt cheap and medium will still be fast enough"), with `google/gemini-3.8-flash` the noted alternative. Standalone until the shared fetch ladder wires it in. Receipt: docs/constants.md "Page digest".
+
+Two further model-id homes exist by design rather than by neglect, and the same test pins both. `DONATED_KEY_BLOCKED_GOOGLE_MODELS` in `fallback_openrouter.py` is a routing blocklist matched against slugs, not a model choice. The offline harnesses pick their own lineups: `ablation/cli_args.py`, `ablation/forecaster_lineup.py`, `ablation/leakage_screen.py`, `ablation/run_stacker.py`, `benchmark/bot_factory.py` and `ensemble_analysis/ensemble_simulator.py`.
+
+## Probabilistic tools: wired, dormant in prod
+
+### `metaculus_bot/probabilistic_tools/`
+
+Reusable probability math: pooling, Beta-Binomial Bayes, percentile → parametric fits (normal/lognormal/Student-t), declared-vs-math consistency checks, Dirichlet CIs, Neg-Bin/Poisson discrete percentiles, exponential/Weibull survival, Gamma-conjugate hazard. `prob_event_before`, `linear_pool` / `log_pool` / `satopaa_extremize`, `beta_binomial_update`, `cdf_at_threshold`, `dirichlet_with_other` are wired into `tool_runner` dispatch. (`poisson_at_least_one` is exported and used inside `mc_discrete.py` / `survival.py`, but is NOT itself dispatched by `tool_runner`.)
+
+Newly-added math (Workstreams D1-D3):
+
+- **Noisy-OR** (`aggregation.py` `noisy_or`): rare-binary decomposition `1 − ∏(1 − pᵢ)` for combining independent failure-mode probabilities. Exported from the package, but NOT currently dispatched by `tool_runner` (no references in `tool_runner.py`). It is a callable available for future wiring, not an active dispatch path. `TODO(noisy-or-wiring)`: either add a binary Noisy-OR dispatch (when a forecaster declares independent sub-event probabilities) or leave as a library-only helper.
+- **Mixture-of-normals** (`mixtures.py`): `MixtureOfNormals` / `MixtureComponent` types, `mixture_cdf`, `fit_mixture_from_percentiles` (multi-start L-BFGS-B with single-normal fallback), and `percentiles_to_metaculus_cdf_via_mixture` (constraint-enforced `PCHIP_CDF_POINTS`-point CDF). The library itself is preserved but currently dormant: the `NumericStructured.mixture_components` schema slot and the router branch that consumed it were removed 2026-07-08 (landed on main in `642b027`, 2026-07-11). The removal was justified at the time as "zero prod fires", which turned out to be wrong: the 2026-08-24 counterfactual round proved one confirmed prod fire (q43826, 2026-06-06, gemini-3.1-pro, whose published CDF reproduces bit-exactly only through the mixture branch) and one rejected attempt (q43913, 2026-06-11, gpt-5.4). The removal decision itself stands on the benchmarks (percentiles+PCHIP outperformed the mixture path in every one), but don't cite "zero prod fires" as its evidence.
+- **Gamma waiting-time, conditional-given-survival**: `gamma_prob_event_before` with elapsed-window split (`survival_distributions.py`), which covers the missing waiting-time fitter alongside the existing exponential / Weibull / Gamma-hazard variants.
+
+`binary_pooling.py` deliberately duplicates two things from the ablation harness's `metaculus_bot/ablation/run_pdf.py` rather than importing them, so that this offline primitive carries no dependency on the ablation harness: the strength to likelihood-ratio table `_STRENGTH_TO_LR`, and the `[0.001, 0.999]` base-probability clamp that `run_pdf._apply_evidence_lr` applies inline before taking log-odds (`_BASE_PROB_FLOOR` / `_BASE_PROB_CEIL` here). Both copies must stay in lockstep with `run_pdf`, and the clamp is deliberately wider than `PROB_CLAMP_EPS`, because `_apply_evidence_lr` here exists to reproduce the ablation baseline exactly.
+
+### `metaculus_bot/tool_runner.py`
+
+Despite the name, **not** an LLM tool-calling harness. A **deterministic probability-math post-processor** that runs on structured JSON blocks emitted by each forecaster (priors, base rates, hazards, percentiles, scenarios) and injects a "Computed quantities" section into per-forecaster rationales plus a cross-model aggregation block into the stacker prompt. Entry points `run_tools_for_forecaster` and `build_cross_model_aggregation`. Gated by `PROBABILISTIC_TOOLS_ENABLED`; both entry points no-op when the flag is unset. **Wired but DORMANT in prod**: all three prod workflows (`.github/workflows/run_bot_on_{tournament,minibench,metaculus_cup}.yaml`) pin `PROBABILISTIC_TOOLS_ENABLED: 'false'` (retired via Workstream C2, which also removed the tier-2 scaffold from the prompts; tool_runner + probabilistic_tools stay behind the flag). The wiring remains live: `run_tools_for_forecaster` runs from `_make_prediction`, and `build_cross_model_aggregation` feeds the stacker prompts in both the STACKING and CONDITIONAL_STACKING paths. A `TOOLS_USED` marker is emitted in the comment trailer alongside the `STACKER_OUTCOME` marker so residual analysis can bucket tool-augmented vs. vanilla runs (always `false` in prod while the flag is off; see `metaculus_bot/comment/markers.py` for the marker-dormancy details). The flag WAS on in production once: `PROBABILISTIC_TOOLS_ENABLED: 'true'` with `PROBABILISTIC_TOOLS_TYPES: 'binary,multiple_choice'` ran on `main` from 0e85e1b (2026-05-18) to 642b027 (PR #53, 2026-07-11), so every binary and multiple-choice comment published in that window carries `TOOLS_USED=true` and a "Computed quantities" block (137 comments, 76 of them resolved and scored as of 2026-09-01). The cross-model block reached only the stacker prompt, and only while stacking was live, which ended 2026-05-29; 12 stacked comments saw it.
