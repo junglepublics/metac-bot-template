@@ -20,7 +20,11 @@ Restate the resolution criteria: what counts as YES, the resolution source, the 
 
 ## 2. Prior
 Find the best starting number, in this order:
-1. A prediction market price (Polymarket, Kalshi, Manifold) for the same question, if one exists.
+1. A prediction market price (Polymarket, Kalshi, Manifold), but only when both conditions hold:
+   - the market is liquid enough that a few traders cannot set the price (Manifold's play money counts for less);
+   - its resolution rules match the question. A market on a different question is not a prior for this one.
+
+   Markets are known to overprice long shots, and long-dated ones sit too close to 50%. The update step may correct for both. Prateek chose this option on 13 November 2026, with the conditions.
 2. For numeric questions, a prior distribution from a simple statistical model of the historical data, such as FRED.
 3. Otherwise, a base rate from a reference class, scaled to the time left before the deadline.
 
